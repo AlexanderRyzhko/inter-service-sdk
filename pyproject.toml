@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "inter-service-sdk"
-version = "1.0.0"
+version = "1.0.1"
 authors = [
     {name = "Blazel", email = "dev@blazel.com"}
 ]
-description = "Generic HTTP client for inter-service communication with auth and encryption"
+description = "Complete framework for inter-service communication with client, server utilities, auth and encryption"
 readme = "README.md"
 requires-python = ">=3.8"
 classifiers = [
@@ -29,8 +29,10 @@ classifiers = [
 keywords = [
     "http",
     "client",
+    "server",
     "api",
     "rest",
+    "fastapi",
     "inter-service",
     "microservices",
     "authentication",
@@ -40,6 +42,7 @@ keywords = [
 ]
 dependencies = [
     "requests>=2.31.0",
+    "fastapi>=0.104.0",
 ]
 
 [project.optional-dependencies]

@@ -1,5 +1,11 @@
 """
-Inter-Service SDK - Generic HTTP client for service-to-service communication.
+Inter-Service SDK - Complete framework for service-to-service communication.
+
+Provides both client-side and server-side utilities:
+- Client: InterServiceClient for making inter-service HTTP requests
+- Server: FastAPI utilities for creating inter-service endpoints
+- Crypto: Optional ECC encryption/decryption
+- Exceptions: Custom exception hierarchy
 """
 
 from .client import InterServiceClient
@@ -10,14 +16,27 @@ from .exceptions import (
     EncryptionError,
     URLBuildError
 )
+from .server import (
+    create_inter_service_router,
+    inter_service_endpoint,
+    format_error_response,
+    format_success_response
+)
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 __all__ = [
+    # Client
     "InterServiceClient",
+    # Exceptions
     "InterServiceError",
     "AuthenticationError",
     "RequestError",
     "EncryptionError",
     "URLBuildError",
+    # Server utilities
+    "create_inter_service_router",
+    "inter_service_endpoint",
+    "format_error_response",
+    "format_success_response",
 ]

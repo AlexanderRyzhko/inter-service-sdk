@@ -11,10 +11,10 @@ long_description = (this_directory / "README.md").read_text(encoding="utf-8")
 
 setup(
     name="inter-service-sdk",
-    version="1.0.0",
+    version="1.0.1",
     author="Blazel",
     author_email="dev@blazel.com",
-    description="Generic HTTP client for inter-service communication with auth and encryption",
+    description="Complete framework for inter-service communication with client, server utilities, auth and encryption",
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/AlexanderRyzhko/inter-service-sdk",
@@ -42,6 +42,7 @@ setup(
     python_requires=">=3.8",
     install_requires=[
         "requests>=2.31.0",
+        "fastapi>=0.104.0",
     ],
     extras_require={
         "crypto": [
@@ -64,8 +65,10 @@ setup(
     keywords=[
         "http",
         "client",
+        "server",
         "api",
         "rest",
+        "fastapi",
         "inter-service",
         "microservices",
         "authentication",
