@@ -1,0 +1,6 @@
+# Core dependencies
+requests>=2.31.0
+
+# Optional: ECC encryption support
+# Install with: pip install inter-service-sdk[crypto]
+# cryptography>=41.0.0
