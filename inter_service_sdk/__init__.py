@@ -18,12 +18,10 @@ from .exceptions import (
 )
 from .server import (
     create_inter_service_router,
-    inter_service_endpoint,
-    format_error_response,
-    format_success_response
+    inter_service_endpoint
 )
 
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 
 __all__ = [
     # Client
@@ -37,6 +35,4 @@ __all__ = [
     # Server utilities
     "create_inter_service_router",
     "inter_service_endpoint",
-    "format_error_response",
-    "format_success_response",
 ]

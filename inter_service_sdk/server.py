@@ -1,11 +1,15 @@
 """
-Server-side utilities for creating inter-service API endpoints with FastAPI.
+Server-side utilities for creating REST-compliant inter-service API endpoints with FastAPI.
 
 Provides decorators and utilities to reduce boilerplate in inter-service endpoints:
 - Router factory with configurable auth
-- Automatic error handling and logging
-- Consistent response formatting
-- Correlation ID management
+- Automatic error handling with proper HTTP status codes
+- Request/response logging with correlation IDs
+- Standard REST response format (data returned directly, errors via HTTPException)
+
+REST Standard:
+- Success: Return data directly → FastAPI returns HTTP 200 with data
+- Errors: Raise HTTPException(status_code=404, detail="...") → FastAPI returns HTTP 404 with error
 """
 
 import logging
@@ -66,32 +70,39 @@ def inter_service_endpoint(
     require_correlation_id: bool = True
 ):
     """
-    Decorator for inter-service endpoints with automatic logging and error handling.
+    Decorator for REST-compliant inter-service endpoints with automatic logging and error handling.
 
     Provides:
     - Request/response logging with correlation IDs
-    - Client host logging
-    - Automatic error handling and formatting
-    - Consistent timestamp formatting
+    - Client host and user-agent logging
+    - Automatic error handling with proper HTTP status codes
+    - Exception to HTTPException conversion
 
     Example:
         @router.get("/users/{user_id}")
         @inter_service_endpoint("get_user")
-        async def get_user(user_id: int, correlation_id: str, request: Request):
-            # Your endpoint logic here
-            return {"user_id": user_id, "name": "John Doe"}
+        async def get_user(
+            user_id: int,
+            correlation_id: str,
+            request: Request,
+            db: Session = Depends(get_db)
+        ):
+            user = db.query(User).filter(User.id == user_id).first()
 
-        # Automatically wrapped response:
-        # {
-        #     "status": "success",
-        #     "data": {"user_id": 123, "name": "John Doe"},
-        #     "correlation_id": "req-001",
-        #     "timestamp": "2025-01-01T00:00:00Z"
-        # }
+            if not user:
+                raise HTTPException(status_code=404, detail="User not found")
+
+            return {"user_id": user.id, "name": user.name}
+
+        # Success returns HTTP 200:
+        # {"user_id": 123, "name": "John Doe"}
+
+        # Error returns HTTP 404:
+        # {"detail": "User not found"}
 
     Args:
-        endpoint_name: Name for logging (e.g., "get_credentials")
-        require_correlation_id: Whether correlation_id parameter is required
+        endpoint_name: Name for logging (e.g., "get_user")
+        require_correlation_id: Whether correlation_id parameter is required (default: True)
 
     Returns:
         Decorated function with automatic logging and error handling
@@ -122,27 +133,16 @@ def inter_service_endpoint(
                 # Execute endpoint function
                 result = await func(*args, **kwargs)
 
-                # If result is already a dict with status field, return as-is
-                if isinstance(result, dict) and "status" in result:
-                    logger.info(f"✅ [{endpoint_name}] Request completed - Status: {result.get('status')}")
-                    return result
-
-                # Otherwise, wrap in standard response format
-                response = {
-                    "status": "success",
-                    "data": result,
-                    "correlation_id": correlation_id,
-                    "timestamp": datetime.now(timezone.utc).isoformat()
-                }
-
                 logger.info(f"✅ [{endpoint_name}] Request completed successfully")
-                return response
+                return result  # Return data directly (FastAPI handles HTTP 200)
 
-            except HTTPException:
-                # Re-raise HTTP exceptions (already have proper status codes)
+            except HTTPException as e:
+                # Re-raise HTTP exceptions (they have proper status codes and details)
+                logger.warning(f"❌ [{endpoint_name}] HTTP {e.status_code}: {e.detail}")
                 raise
 
             except Exception as e:
+                # Unexpected errors become HTTP 500
                 logger.error(f"❌ [{endpoint_name}] Error: {str(e)}", exc_info=True)
                 raise HTTPException(
                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -151,88 +151,3 @@ def inter_service_endpoint(
 
         return wrapper
     return decorator
-
-
-def format_error_response(
-    message: str,
-    correlation_id: str,
-    status_code: int = 500,
-    **extra_fields
-) -> Dict[str, Any]:
-    """
-    Format standard error response.
-
-    Args:
-        message: Error message
-        correlation_id: Request correlation ID
-        status_code: HTTP status code (not included in response, for reference)
-        **extra_fields: Additional fields to include in response
-
-    Returns:
-        Formatted error response dict
-
-    Example:
-        return format_error_response(
-            message="User not found",
-            correlation_id="req-001",
-            status_code=404,
-            user_id=123
-        )
-        # Returns:
-        # {
-        #     "status": "error",
-        #     "error": "User not found",
-        #     "correlation_id": "req-001",
-        #     "timestamp": "2025-01-01T00:00:00Z",
-        #     "user_id": 123
-        # }
-    """
-    response = {
-        "status": "error",
-        "error": message,
-        "correlation_id": correlation_id,
-        "timestamp": datetime.now(timezone.utc).isoformat()
-    }
-    response.update(extra_fields)
-    return response
-
-
-def format_success_response(
-    data: Any,
-    correlation_id: str,
-    **extra_fields
-) -> Dict[str, Any]:
-    """
-    Format standard success response.
-
-    Args:
-        data: Response data
-        correlation_id: Request correlation ID
-        **extra_fields: Additional fields to include in response
-
-    Returns:
-        Formatted success response dict
-
-    Example:
-        return format_success_response(
-            data={"user_id": 123, "name": "John"},
-            correlation_id="req-001",
-            cache_hit=True
-        )
-        # Returns:
-        # {
-        #     "status": "success",
-        #     "data": {"user_id": 123, "name": "John"},
-        #     "correlation_id": "req-001",
-        #     "timestamp": "2025-01-01T00:00:00Z",
-        #     "cache_hit": True
-        # }
-    """
-    response = {
-        "status": "success",
-        "data": data,
-        "correlation_id": correlation_id,
-        "timestamp": datetime.now(timezone.utc).isoformat()
-    }
-    response.update(extra_fields)
-    return response
