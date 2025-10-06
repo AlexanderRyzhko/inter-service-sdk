@@ -4,6 +4,7 @@ Inter-service HTTP client with bearer auth and optional encryption.
 
 import time
 import logging
+import uuid
 from typing import Optional, Dict, Any
 import requests
 from requests.exceptions import RequestException, Timeout
@@ -118,10 +119,18 @@ class InterServiceClient:
         Example:
             >>> response = client.request(
             ...     endpoint="users/{user_id}",
-            ...     path_params={"user_id": 123},
-            ...     query_params={"correlation_id": "track-001"}
+            ...     path_params={"user_id": 123}
             ... )
         """
+        # Auto-generate correlation_id if not provided
+        if query_params is None:
+            query_params = {}
+
+        if "correlation_id" not in query_params:
+            correlation_id = str(uuid.uuid4())
+            query_params["correlation_id"] = correlation_id
+            logger.debug(f"Auto-generated correlation_id: {correlation_id}")
+
         # Build URL
         url = build_url(
             self.base_url,

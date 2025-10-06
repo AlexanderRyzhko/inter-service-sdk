@@ -28,13 +28,16 @@ client = InterServiceClient(
     api_key="your-secret-key"
 )
 
-# Make a request
+# Make a request (correlation_id auto-generated)
 response = client.request(
     endpoint="users/{user_id}",
     path_params={"user_id": 123}
 )
 
-print(response["data"])
+if response["status"] == "success":
+    print(response["data"])
+else:
+    print(f"Error: {response['error']}")
 ```
 
 ## Usage
@@ -48,7 +51,8 @@ client = InterServiceClient(
 )
 
 # GET /api/v1/inter-service/users/123
-user = client.request(
+# correlation_id auto-generated
+response = client.request(
     endpoint="users/{user_id}",
     path_params={"user_id": 123}
 )
@@ -58,12 +62,22 @@ user = client.request(
 
 ```python
 # GET /api/v1/inter-service/users/search?q=john&type=email&limit=10
-results = client.request(
+# correlation_id auto-generated and added to query params
+response = client.request(
     endpoint="users/search",
     query_params={
         "q": "john",
         "type": "email",
         "limit": 10
+    }
+)
+
+# Custom correlation_id (optional)
+response = client.request(
+    endpoint="users/search",
+    query_params={
+        "q": "john",
+        "correlation_id": "my-custom-id-123"
     }
 )
 ```
