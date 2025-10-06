@@ -39,7 +39,7 @@ def build_url(
     """
     try:
         # Substitute path parameters
-        if path_params:
+        if path_params is not None:
             endpoint = endpoint.format(**path_params)
 
         # Build full URL

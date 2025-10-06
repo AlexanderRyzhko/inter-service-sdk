@@ -75,3 +75,7 @@ dmypy.json
 
 # pyenv
 .python-version
+
+# Local configuration
+local.env
+local.py

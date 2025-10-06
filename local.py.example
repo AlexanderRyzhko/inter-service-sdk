@@ -1,0 +1,10 @@
+# PyPI API Tokens
+# Copy this file to local.py and add your tokens
+
+# Production PyPI API Token
+# Get from: https://pypi.org/manage/account/token/
+PYPI_API_TOKEN = "pypi-your-production-token-here"
+
+# Test PyPI API Token
+# Get from: https://test.pypi.org/manage/account/token/
+TEST_PYPI_API_TOKEN = "pypi-your-test-token-here"
