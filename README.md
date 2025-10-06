@@ -125,6 +125,71 @@ response = client.request(
 )
 ```
 
+## Server-Side Utilities
+
+The SDK also provides FastAPI utilities for creating REST-compliant inter-service endpoints.
+
+### Creating a Router
+
+```python
+from fastapi import FastAPI, Depends
+from inter_service_sdk.server import create_inter_service_router, inter_service_endpoint
+
+# Create router with authentication
+router = create_inter_service_router(
+    auth_dependency=Depends(your_auth_function)
+)
+
+app = FastAPI()
+app.include_router(router)
+```
+
+### Creating Endpoints
+
+```python
+from fastapi import Request, HTTPException
+from sqlalchemy.orm import Session
+
+@router.get("/users/{user_id}")
+@inter_service_endpoint("get_user")
+async def get_user(
+    user_id: int,
+    correlation_id: str,
+    request: Request,
+    db: Session = Depends(get_db)
+):
+    # Business logic only - SDK handles logging and errors
+    user = db.query(User).filter(User.id == user_id).first()
+
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    return {"id": user.id, "name": user.name}  # Direct return
+```
+
+### Features
+
+- **Automatic Logging**: Request/response logging with correlation IDs
+- **Error Handling**: Converts exceptions to proper HTTP status codes
+- **REST Standard**: Returns data directly (200) or raises HTTPException (404, 500)
+- **Authentication**: Configurable auth dependency for entire router
+
+### Response Format
+
+- **Success**: Return data directly → FastAPI returns HTTP 200 with data
+- **Errors**: Raise HTTPException → FastAPI returns HTTP 404/500 with error detail
+
+```python
+# ✅ Correct
+return {"user_id": 123, "name": "John"}
+
+# ✅ Correct
+raise HTTPException(status_code=404, detail="Not found")
+
+# ❌ Incorrect - Don't wrap in envelope
+return {"status": "success", "data": {...}}
+```
+
 ## API Reference
 
 ### InterServiceClient
