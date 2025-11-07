@@ -91,7 +91,8 @@ def update_dependent_projects(new_version):
 
     projects = [
         ("auto_login", "../auto_login/requirements.txt"),
-        ("browser-ninja", "../browser-ninja/requirements.txt")
+        ("browser-ninja", "../browser-ninja/requirements.txt"),
+        ("diy", "../diy/backend/requirements.txt")
     ]
 
     updated_count = 0
