@@ -47,7 +47,8 @@ class InterServiceClient:
         timeout: int = 30,
         retry_attempts: int = 3,
         ecc_private_key: Optional[str] = None,
-        ecc_public_key: Optional[str] = None
+        ecc_public_key: Optional[str] = None,
+        use_connection_pool: bool = False
     ):
         """
         Initialize inter-service client.
@@ -60,6 +61,9 @@ class InterServiceClient:
             retry_attempts: Number of retry attempts (default: 3)
             ecc_private_key: ECC private key for decryption (PEM format)
             ecc_public_key: ECC public key for encryption (PEM format)
+            use_connection_pool: Use persistent session with connection pooling (default: False)
+                                Note: Connection pooling can cause issues when services restart.
+                                Only enable if you need the performance benefit and can handle stale connections.
         """
         self.base_url = base_url.rstrip('/')
         self.api_key = api_key
@@ -68,17 +72,24 @@ class InterServiceClient:
         self.retry_attempts = retry_attempts
         self.ecc_private_key = ecc_private_key
         self.ecc_public_key = ecc_public_key
+        self.use_connection_pool = use_connection_pool
 
-        # Setup session with auth headers
-        self.session = requests.Session()
-        self.session.headers.update({
+        # Prepare default headers
+        self.default_headers = {
             'Authorization': f'Bearer {api_key}',
             'User-Agent': 'InterServiceSDK/1.0.0',
             'Content-Type': 'application/json',
             'Accept': 'application/json'
-        })
+        }
 
-        logger.info(f"InterServiceClient initialized: {base_url}{api_prefix}")
+        # Setup session with connection pooling only if requested
+        if use_connection_pool:
+            self.session = requests.Session()
+            self.session.headers.update(self.default_headers)
+            logger.info(f"InterServiceClient initialized with connection pooling: {base_url}{api_prefix}")
+        else:
+            self.session = None
+            logger.info(f"InterServiceClient initialized with fresh connections: {base_url}{api_prefix}")
 
     def request(
         self,
@@ -160,7 +171,13 @@ class InterServiceClient:
                 json_data = data
 
         # Merge headers
-        request_headers = self.session.headers.copy()
+        if self.session:
+            # Using connection pool - use session headers
+            request_headers = self.session.headers.copy()
+        else:
+            # Using fresh connections - use default headers
+            request_headers = self.default_headers.copy()
+
         if headers:
             request_headers.update(headers)
 
@@ -169,13 +186,24 @@ class InterServiceClient:
             try:
                 logger.debug(f"{method} {url}")
 
-                response = self.session.request(
-                    method=method.upper(),
-                    url=url,
-                    json=json_data,
-                    headers=request_headers,
-                    timeout=timeout or self.timeout
-                )
+                if self.session:
+                    # Use persistent session with connection pooling
+                    response = self.session.request(
+                        method=method.upper(),
+                        url=url,
+                        json=json_data,
+                        headers=request_headers,
+                        timeout=timeout or self.timeout
+                    )
+                else:
+                    # Use fresh connection for each request
+                    response = requests.request(
+                        method=method.upper(),
+                        url=url,
+                        json=json_data,
+                        headers=request_headers,
+                        timeout=timeout or self.timeout
+                    )
 
                 # Handle HTTP errors
                 if response.status_code >= 400:
