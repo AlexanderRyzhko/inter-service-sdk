@@ -21,7 +21,7 @@ from .server import (
     inter_service_endpoint
 )
 
-__version__ = "1.0.2"
+__version__ = "1.0.3"
 
 __all__ = [
     # Client
