@@ -164,7 +164,7 @@ class InterServiceClient:
                     return {
                         "status": "error",
                         "data": None,
-                        "status_code": None,
+                        "status_code": 500,
                         "error": f"Encryption failed: {str(e)}"
                     }
             else:
@@ -254,7 +254,7 @@ class InterServiceClient:
                     return {
                         "status": "error",
                         "data": None,
-                        "status_code": None,
+                        "status_code": 504,
                         "error": f"Request timed out after {timeout or self.timeout} seconds"
                     }
                 time.sleep(2 ** attempt)  # Exponential backoff
@@ -265,7 +265,7 @@ class InterServiceClient:
                     return {
                         "status": "error",
                         "data": None,
-                        "status_code": None,
+                        "status_code": 503,
                         "error": str(e)
                     }
                 time.sleep(2 ** attempt)  # Exponential backoff
@@ -275,7 +275,7 @@ class InterServiceClient:
                 return {
                     "status": "error",
                     "data": None,
-                    "status_code": None,
+                    "status_code": 500,
                     "error": f"Unexpected error: {str(e)}"
                 }
 
@@ -283,6 +283,6 @@ class InterServiceClient:
         return {
             "status": "error",
             "data": None,
-            "status_code": None,
+            "status_code": 503,
             "error": "Max retries exceeded"
         }
