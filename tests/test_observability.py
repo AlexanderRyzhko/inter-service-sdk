@@ -346,6 +346,20 @@ def test_overflow_drops_countable():
     assert sub.dropped == 1
 
 
+def test_db_factory_failure_counts_as_drop():
+    # A persistent db_factory failure (bad URI / missing motor) discards the
+    # batch — count it in `dropped` so alerting sees DB-misconfig loss, not only
+    # queue overflow.
+    def bad_factory():
+        raise RuntimeError("bad uri")
+
+    sub = ObservabilitySubmitter(bad_factory)
+    sub.submit([llm_trace("run-1")], user_id="geoff", client_email="g@b.com")
+    _drain_sync(sub)
+    assert sub.dropped == 1
+    _close_sync(sub)
+
+
 def test_sync_transport_null_user_id_dropped_by_writer():
     # AC3: the transport reuses ObservabilityWriter, so the null-user_id whole-
     # batch drop still applies — nothing is written for an unauthenticated batch.

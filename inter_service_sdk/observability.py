@@ -488,7 +488,8 @@ class ObservabilityWriter:
 
 # Default depth of the in-memory hand-off queue between the (sync) request
 # thread and the writer loop. Bounded so a trace-store outage can't grow memory
-# without limit; overflow drops the oldest-arriving submit with a countable log.
+# without limit; on overflow ``put_nowait`` raises QueueFull and the incoming
+# (newest) submit is dropped with a countable log — the backlog is preserved.
 DEFAULT_QUEUE_MAX = 1000
 
 # Sentinel so ``submit(user_id=None)`` (an explicit, meaningful null) is
@@ -626,7 +627,11 @@ class ObservabilitySubmitter:
         try:
             loop = self._ensure_worker()
             loop.call_soon_threadsafe(self._put_nowait, (batch, uid, email))
-            self.submitted += 1
+            # submit() is documented safe from any thread, and `+=` is a
+            # non-atomic read-modify-write, so guard the counter (uncontended
+            # after worker warmup except vs. other concurrent submits).
+            with self._lock:
+                self.submitted += 1
             return True
         except Exception:  # noqa: BLE001 — fire-and-forget, never surface
             logger.debug("observability submit failed", exc_info=True)
@@ -685,6 +690,11 @@ class ObservabilitySubmitter:
                     batch, uid, email = item
                     # write_records is itself never-raising + time-bounded.
                     await writer.write_records(batch, user_id=uid, client_email=email)
+                else:
+                    # db_factory failed (bad URI / missing motor): count the
+                    # discarded batch so `dropped` reflects DB-misconfig loss, not
+                    # just queue overflow. Safe unlocked — worker thread only.
+                    self.dropped += 1
             except Exception as exc:  # noqa: BLE001 — never propagate off the loop
                 logger.warning("observability_submit event=error err=%s", exc)
             finally:
