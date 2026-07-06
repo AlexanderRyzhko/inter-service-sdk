@@ -348,7 +348,14 @@ class ObservabilityWriter:
         carrying a ``kind`` (``llm_trace`` | ``tool_call`` | ``agent_run``) and a
         ``run_id``. Returns the count of records successfully written.
         """
-        batch = list(records)
+        # Materialize inside the guard: an input generator that raises mid
+        # iteration must not escape the never-raise contract either.
+        try:
+            batch = list(records)
+        except Exception as e:  # noqa: BLE001 — never surface a producer failure
+            logger.warning("Observability write dropped: record iterable raised: %s", e)
+            return 0
+
         # Identity is REQUIRED. ``user_id`` is nullable for some authenticated
         # callers (service-principal / API-key tokens). Writing with a null
         # user_id would (a) collapse all such callers into a shared
@@ -361,6 +368,33 @@ class ObservabilityWriter:
                 "Observability write dropped: no authenticated user_id "
                 "(identity required for tenant-scoped traces); %d record(s)",
                 len(batch),
+            )
+            return 0
+
+        # Fail-safe: the tenant-scoped agent_runs id is the contract string
+        # ``"<user_id>:<run_id>"``. A ``:`` inside user_id would make that key
+        # non-injective (two distinct (user_id, run_id) pairs could collide),
+        # re-opening a cross-tenant clobber. Real identities (s3_user_id slug /
+        # UUID) never contain ``:`` — drop defensively if one ever does rather
+        # than write a colliding key.
+        if ":" in user_id:
+            logger.warning(
+                "Observability write dropped: user_id contains ':' separator "
+                "(would break tenant-scoped agent_run id); %d record(s)",
+                len(batch),
+            )
+            return 0
+
+        # Batch cap backstop. The boundary gate ``validate_batch`` RAISES (→ 422)
+        # for well-behaved callers; the writer is fire-and-forget, so an
+        # over-cap batch that reached it (a caller that skipped the gate) is
+        # dropped with a warning rather than raised. Not a silent no-op — the
+        # configured cap is enforced here too.
+        if len(batch) > self.max_records_per_batch:
+            logger.warning(
+                "Observability write dropped: batch of %d exceeds "
+                "max_records_per_batch=%d",
+                len(batch), self.max_records_per_batch,
             )
             return 0
 

@@ -223,3 +223,40 @@ async def test_write_times_out_and_drops():
         [llm_trace("run-1")], user_id="geoff", client_email="g@b.com"
     )
     assert n == 0  # slow sink bounded, batch dropped, no raise
+
+
+# --- Writer: cap backstop, colon guard, generator-raises -------------------
+
+async def test_writer_enforces_batch_cap_backstop():
+    # Writer cap is a real backstop for callers that skip validate_batch:
+    # over-cap → drop + warn (fire-and-forget), not raise, not a no-op.
+    db = FakeDB()
+    writer = ObservabilityWriter(db, max_records_per_batch=2)
+    records = [llm_trace(f"r-{i}") for i in range(3)]
+    n = await writer.write_records(records, user_id="geoff", client_email="g@b.com")
+    assert n == 0
+    assert _writes(db) == []
+
+
+async def test_writer_drops_user_id_with_colon():
+    # A ':' in user_id would make the tenant-scoped agent_run _id non-injective.
+    db = FakeDB()
+    writer = ObservabilityWriter(db)
+    n = await writer.write_records(
+        [agent_run("run-1")], user_id="acme:corp", client_email="g@b.com"
+    )
+    assert n == 0
+    assert _writes(db) == []
+
+
+async def test_write_never_raises_on_generator_error():
+    def bad_records():
+        yield llm_trace("run-1")
+        raise RuntimeError("producer blew up")
+
+    db = FakeDB()
+    writer = ObservabilityWriter(db)
+    n = await writer.write_records(
+        bad_records(), user_id="geoff", client_email="g@b.com"
+    )
+    assert n == 0  # producer failure swallowed, never escapes
