@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "inter-service-sdk"
-version = "1.0.4"
+version = "1.1.0"
 authors = [
     {name = "Blazel", email = "dev@blazel.com"}
 ]
@@ -49,10 +49,14 @@ dependencies = [
 crypto = [
     "cryptography>=41.0.0",
 ]
+observability = [
+    "pymongo>=4.0.0",
+]
 dev = [
     "pytest>=7.4.0",
     "pytest-cov>=4.1.0",
     "pytest-mock>=3.11.1",
+    "pytest-asyncio>=0.21.0",
     "requests-mock>=1.11.0",
     "black>=23.0.0",
     "flake8>=6.1.0",
@@ -61,6 +65,7 @@ dev = [
     "build>=1.0.0",
     "twine>=4.0.0",
     "cryptography>=41.0.0",
+    "pymongo>=4.0.0",
 ]
 
 [project.urls]
@@ -72,6 +77,7 @@ Documentation = "https://github.com/AlexanderRyzhko/inter-service-sdk#readme"
 [tool.pytest.ini_options]
 minversion = "7.0"
 addopts = "-ra -q --strict-markers --cov=inter_service_sdk"
+asyncio_mode = "auto"
 testpaths = [
     "tests",
 ]
