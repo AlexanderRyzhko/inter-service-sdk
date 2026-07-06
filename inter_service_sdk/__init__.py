@@ -22,6 +22,7 @@ from .server import (
 )
 from .observability import (
     ObservabilityWriter,
+    ObservabilitySubmitter,
     ObservabilityError,
     BatchTooLargeError,
     InvalidRecordError,
@@ -35,9 +36,10 @@ from .observability import (
     DEFAULT_MAX_RECORDS_PER_BATCH,
     DEFAULT_WRITE_TIMEOUT_S,
     DEFAULT_TTL_DAYS,
+    DEFAULT_QUEUE_MAX,
 )
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 __all__ = [
     # Client
@@ -53,6 +55,9 @@ __all__ = [
     "inter_service_endpoint",
     # Observability write-client (BLA-1342)
     "ObservabilityWriter",
+    # Sync-safe transport (BLA-1382)
+    "ObservabilitySubmitter",
+    "DEFAULT_QUEUE_MAX",
     "ObservabilityError",
     "BatchTooLargeError",
     "InvalidRecordError",

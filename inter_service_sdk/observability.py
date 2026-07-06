@@ -30,8 +30,9 @@ the extra: ``pip install inter-service-sdk[observability]``. The builders and
 """
 import asyncio
 import logging
+import threading
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Mapping, Optional
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -481,3 +482,268 @@ class ObservabilityWriter:
         except Exception as e:  # noqa: BLE001 — per-group best-effort
             logger.warning("Failed to write %d %s record(s): %s", len(payload), op, e)
             return 0
+
+
+# --- Sync-safe transport (daemon-thread submitter) ------------------------
+
+# Default depth of the in-memory hand-off queue between the (sync) request
+# thread and the writer loop. Bounded so a trace-store outage can't grow memory
+# without limit; overflow drops the oldest-arriving submit with a countable log.
+DEFAULT_QUEUE_MAX = 1000
+
+# Sentinel so ``submit(user_id=None)`` (an explicit, meaningful null) is
+# distinguishable from "identity not supplied, fall back to the constructor
+# default".
+_UNSET = object()
+
+
+def _documentdb_client_kwargs(mongo_uri: str, tls_ca_file: Optional[str]) -> Dict[str, Any]:
+    """Motor client kwargs honoring the AWS DocumentDB contract.
+
+    DocumentDB requires TLS and does NOT support retryable writes — motor's
+    default ``retryWrites=True`` makes every insert raise. When a TLS CA is
+    configured (the DocumentDB path) default ``retryWrites=False`` unless the URI
+    already pins it. Mirrors the pattern the per-service writers used before the
+    transport was folded into the SDK.
+    """
+    kwargs: Dict[str, Any] = {"serverSelectionTimeoutMS": 5000}
+    if tls_ca_file:
+        kwargs["tls"] = True
+        kwargs["tlsCAFile"] = tls_ca_file
+        if "retrywrites" not in mongo_uri.lower():
+            kwargs["retryWrites"] = False
+    return kwargs
+
+
+class ObservabilitySubmitter:
+    """Fire-and-forget-from-sync transport wrapping :class:`ObservabilityWriter`.
+
+    ``ObservabilityWriter.write_records`` is a coroutine: it assumes a **live**
+    event loop it can be awaited on (async callers ``asyncio.create_task`` it off
+    a request path). Sync callers can't — e.g. radaric's concept extraction runs
+    ``Runner.run_sync`` → ``loop.run_until_complete``; that loop stops the instant
+    the wrapped call returns, so a task scheduled on it would never run and the
+    trace would be lost.
+
+    This transport owns a dedicated daemon thread running its own event loop,
+    created lazily on first :meth:`submit`. ``submit`` hands the batch to that
+    loop via ``call_soon_threadsafe`` and returns immediately — safe to call from
+    any thread, with or without a running loop.
+
+    Persistence is delegated to a single :class:`ObservabilityWriter` built on the
+    worker loop, so every contract invariant (server-authoritative identity stamp,
+    tenant-scoped ``agent_runs._id``, null-``user_id`` drop, TTL indexes, batch
+    cap, per-write timeout, never-raise) is reused — NOT re-derived here.
+
+    The db handle is built lazily on the worker loop via ``db_factory`` because
+    Motor clients bind to the loop that is running when they are created; building
+    it eagerly on the caller's thread would bind it to the wrong loop and writes
+    would hang. Use :meth:`from_motor_uri` for the common URI case.
+    """
+
+    def __init__(
+        self,
+        db_factory: Callable[[], Any],
+        *,
+        user_id: Optional[str] = None,
+        client_email: Optional[str] = None,
+        ttl_days: int = DEFAULT_TTL_DAYS,
+        max_records_per_batch: int = DEFAULT_MAX_RECORDS_PER_BATCH,
+        write_timeout_s: float = DEFAULT_WRITE_TIMEOUT_S,
+        queue_max: int = DEFAULT_QUEUE_MAX,
+    ) -> None:
+        self._db_factory = db_factory
+        self._default_user_id = user_id
+        self._default_client_email = client_email
+        self._writer_kwargs = dict(
+            ttl_days=ttl_days,
+            max_records_per_batch=max_records_per_batch,
+            write_timeout_s=write_timeout_s,
+        )
+        self._queue_max = queue_max
+        self._lock = threading.Lock()
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._thread: Optional[threading.Thread] = None
+        self._queue: Optional[asyncio.Queue] = None
+        self._writer: Optional[ObservabilityWriter] = None
+        self._consumer_task: Optional[asyncio.Task] = None
+        self._ready = threading.Event()
+        self.dropped = 0
+        self.submitted = 0
+
+    @classmethod
+    def from_motor_uri(
+        cls,
+        mongo_uri: str,
+        db_name: str,
+        *,
+        tls_ca_file: Optional[str] = None,
+        **kwargs: Any,
+    ) -> "ObservabilitySubmitter":
+        """Build a submitter whose db handle is a Motor database at ``mongo_uri``.
+
+        The Motor client is created lazily on the worker loop (see class docs).
+        ``motor`` is imported inside the factory so importing the SDK doesn't
+        require it — install the ``observability`` extra (motor→pymongo).
+        """
+
+        def factory() -> Any:
+            from motor.motor_asyncio import AsyncIOMotorClient
+
+            client = AsyncIOMotorClient(
+                mongo_uri, **_documentdb_client_kwargs(mongo_uri, tls_ca_file)
+            )
+            return client[db_name]
+
+        return cls(factory, **kwargs)
+
+    # --- public: safe to call from any thread (the request path) ------------
+
+    def submit(
+        self,
+        records: Iterable[Mapping[str, Any]],
+        *,
+        user_id: Any = _UNSET,
+        client_email: Any = _UNSET,
+    ) -> bool:
+        """Enqueue a batch for fire-and-forget writing. Never raises.
+
+        Identity precedence: an explicit ``user_id`` / ``client_email`` argument
+        (including an explicit ``None``) wins over the constructor default. The
+        actual write applies all writer invariants (null-drop, cap, stamp, etc.);
+        this method only hands work to the writer loop and returns immediately.
+
+        Returns ``True`` if the batch was handed off, ``False`` if it was dropped
+        (bad iterable or the worker could not be reached).
+        """
+        uid = self._default_user_id if user_id is _UNSET else user_id
+        email = self._default_client_email if client_email is _UNSET else client_email
+        try:
+            batch = list(records)
+        except Exception:  # noqa: BLE001 — a producer failure must not escape
+            logger.warning("observability submit dropped: record iterable raised", exc_info=True)
+            return False
+        try:
+            loop = self._ensure_worker()
+            loop.call_soon_threadsafe(self._put_nowait, (batch, uid, email))
+            self.submitted += 1
+            return True
+        except Exception:  # noqa: BLE001 — fire-and-forget, never surface
+            logger.debug("observability submit failed", exc_info=True)
+            return False
+
+    # --- worker thread internals --------------------------------------------
+
+    def _ensure_worker(self) -> asyncio.AbstractEventLoop:
+        if self._loop is not None:
+            return self._loop
+        with self._lock:
+            if self._loop is not None:
+                return self._loop
+            loop = asyncio.new_event_loop()
+            thread = threading.Thread(
+                target=self._run_loop, args=(loop,),
+                name="observability_submitter", daemon=True,
+            )
+            thread.start()
+            self._loop = loop
+            self._thread = thread
+            # Do NOT wait for readiness here — this runs on the request path and
+            # must stay fire-and-forget. ``call_soon_threadsafe`` tolerates a loop
+            # that hasn't reached run_forever yet; the callback fires once it does
+            # (after the queue is created). Readiness is only awaited in drain().
+            return loop
+
+    def _run_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        asyncio.set_event_loop(loop)
+        queue: asyncio.Queue = asyncio.Queue(maxsize=self._queue_max)
+        self._queue = queue
+        self._consumer_task = loop.create_task(self._consume(queue))
+        self._ready.set()
+        loop.run_forever()
+
+    def _put_nowait(self, item) -> None:
+        # Runs on the worker loop.
+        queue = self._queue
+        if queue is None:
+            return
+        try:
+            queue.put_nowait(item)
+        except asyncio.QueueFull:
+            self.dropped += 1
+            logger.warning(
+                "observability_submit event=drop reason=queue_full dropped_total=%d",
+                self.dropped,
+            )
+
+    async def _consume(self, queue: asyncio.Queue) -> None:
+        while True:
+            item = await queue.get()
+            try:
+                writer = self._get_writer()
+                if writer is not None:
+                    batch, uid, email = item
+                    # write_records is itself never-raising + time-bounded.
+                    await writer.write_records(batch, user_id=uid, client_email=email)
+            except Exception as exc:  # noqa: BLE001 — never propagate off the loop
+                logger.warning("observability_submit event=error err=%s", exc)
+            finally:
+                queue.task_done()
+
+    def _get_writer(self) -> Optional[ObservabilityWriter]:
+        """Build the writer once, lazily, on the worker loop.
+
+        A db_factory failure (bad URI, missing motor) is swallowed + logged so it
+        never breaks the loop; the next submit retries construction.
+        """
+        if self._writer is not None:
+            return self._writer
+        try:
+            db = self._db_factory()
+        except Exception:  # noqa: BLE001 — best-effort; retry on next item
+            logger.warning("observability_submit: db_factory failed (will retry)", exc_info=True)
+            return None
+        self._writer = ObservabilityWriter(db, **self._writer_kwargs)
+        return self._writer
+
+    # --- test / shutdown helpers --------------------------------------------
+
+    async def drain(self) -> None:
+        """Wait until the queue is fully processed (cross-thread safe, test-only)."""
+        if self._loop is None:
+            return
+        await asyncio.get_event_loop().run_in_executor(None, self._ready.wait, 2)
+        if self._queue is None:
+            return
+        fut = asyncio.run_coroutine_threadsafe(self._queue.join(), self._loop)
+        await asyncio.wrap_future(fut)
+
+    async def aclose(self) -> None:
+        """Cleanly stop the worker thread/loop (cancel consumer, stop, close)."""
+        loop, thread, task = self._loop, self._thread, self._consumer_task
+        self._loop = None
+        self._thread = None
+        self._consumer_task = None
+        self._queue = None
+        self._writer = None
+        self._ready.clear()
+        if loop is None:
+            return
+
+        async def _shutdown() -> None:
+            if task is not None:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            loop.stop()
+
+        try:
+            asyncio.run_coroutine_threadsafe(_shutdown(), loop)
+        except RuntimeError:
+            loop.call_soon_threadsafe(loop.stop)
+        if thread is not None:
+            await asyncio.get_event_loop().run_in_executor(None, thread.join, 2)
+        if (thread is None or not thread.is_alive()) and not loop.is_closed():
+            loop.close()

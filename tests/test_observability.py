@@ -12,6 +12,8 @@ import pytest
 
 from inter_service_sdk.observability import (
     ObservabilityWriter,
+    ObservabilitySubmitter,
+    _documentdb_client_kwargs,
     BatchTooLargeError,
     InvalidRecordError,
     validate_batch,
@@ -260,3 +262,137 @@ async def test_write_never_raises_on_generator_error():
         bad_records(), user_id="geoff", client_email="g@b.com"
     )
     assert n == 0  # producer failure swallowed, never escapes
+
+
+# --- Sync-safe transport: ObservabilitySubmitter (BLA-1382) ----------------
+# These are SYNC tests: the transport owns its own daemon thread + loop, so the
+# test drives it from a plain sync context (which is the whole point — the caller
+# has no live loop of its own).
+
+
+def _drain_sync(sub, timeout=2.0):
+    """Block the calling thread until the submitter's queue is fully processed."""
+    sub._ready.wait(timeout)
+    if sub._queue is None:
+        return
+    fut = asyncio.run_coroutine_threadsafe(sub._queue.join(), sub._loop)
+    fut.result(timeout)
+
+
+def _close_sync(sub):
+    # Drive the production aclose() from a throwaway loop: it cancels the consumer
+    # task and awaits it (so no task is left pending at GC), stops + joins the
+    # worker thread, and closes the worker loop.
+    if sub._loop is None:
+        return
+    tmp = asyncio.new_event_loop()
+    try:
+        tmp.run_until_complete(sub.aclose())
+    finally:
+        tmp.close()
+
+
+def test_sync_submit_survives_loop_stop():
+    # AC1: a sync caller whose event loop stops the instant the wrapped call
+    # returns must NOT lose the write. asyncio.create_task on that dying loop
+    # would; the daemon-thread submitter must not.
+    db = FakeDB()
+    sub = ObservabilitySubmitter(lambda: db)
+    caller_loop = asyncio.new_event_loop()
+
+    async def _do():
+        sub.submit([llm_trace("run-1", model="m")], user_id="geoff", client_email="g@b.com")
+
+    caller_loop.run_until_complete(_do())
+    caller_loop.close()  # caller's loop is GONE — a task on it would never run
+
+    _drain_sync(sub)
+    assert any(coll == LLM_TRACES for (_op, coll, _p) in _writes(db))
+    _close_sync(sub)
+
+
+def test_submit_returns_immediately_and_never_raises_on_dead_sink():
+    # AC2: submit is fire-and-forget even when the store is down — no raise, and
+    # the batch is handed off. The write itself is swallowed by the writer.
+    db = FakeDB(raises=True)
+    sub = ObservabilitySubmitter(lambda: db)
+    ok = sub.submit([llm_trace("run-1")], user_id="geoff", client_email="g@b.com")
+    assert ok is True
+    assert sub.submitted == 1
+    _drain_sync(sub)  # completes without raising
+    _close_sync(sub)
+
+
+def test_submit_bad_iterable_returns_false():
+    # AC2: a producer that raises while being materialized is dropped, not raised.
+    def bad():
+        yield llm_trace("run-1")
+        raise RuntimeError("producer blew up")
+
+    sub = ObservabilitySubmitter(lambda: FakeDB())
+    assert sub.submit(bad()) is False
+    _close_sync(sub)
+
+
+def test_overflow_drops_countable():
+    # AC2: a bounded queue drops on overflow with a countable counter (not a
+    # silent no-op, not unbounded growth). Drive _put_nowait directly against a
+    # pre-filled queue for a deterministic (timing-free) overflow.
+    sub = ObservabilitySubmitter(lambda: FakeDB(), queue_max=1)
+    q = asyncio.Queue(maxsize=1)
+    q.put_nowait(("filled", "u", "e"))
+    sub._queue = q
+    sub._put_nowait(("overflow", "u", "e"))
+    assert sub.dropped == 1
+
+
+def test_sync_transport_null_user_id_dropped_by_writer():
+    # AC3: the transport reuses ObservabilityWriter, so the null-user_id whole-
+    # batch drop still applies — nothing is written for an unauthenticated batch.
+    db = FakeDB()
+    sub = ObservabilitySubmitter(lambda: db)
+    sub.submit([llm_trace("run-1")], user_id=None, client_email="g@b.com")
+    _drain_sync(sub)
+    assert _writes(db) == []
+    _close_sync(sub)
+
+
+def test_sync_transport_stamps_default_sentinel_identity():
+    # AC3 + AC6: constructor identity (e.g. radaric-system sentinel) is applied
+    # when submit passes no explicit identity, and the writer stamps it server-
+    # authoritatively (received_at present).
+    db = FakeDB()
+    sub = ObservabilitySubmitter(lambda: db, user_id="radaric-system")
+    sub.submit([llm_trace("run-1", model="m")])
+    _drain_sync(sub)
+    (_op, coll, docs) = _writes(db)[0]
+    assert coll == LLM_TRACES
+    assert docs[0]["user_id"] == "radaric-system"
+    assert "received_at" in docs[0]
+    _close_sync(sub)
+
+
+def test_submit_explicit_identity_overrides_default():
+    # Explicit submit identity wins over the constructor default.
+    db = FakeDB()
+    sub = ObservabilitySubmitter(lambda: db, user_id="radaric-system")
+    sub.submit([llm_trace("run-1", model="m")], user_id="real-user", client_email="u@b.com")
+    _drain_sync(sub)
+    (_op, _coll, docs) = _writes(db)[0]
+    assert docs[0]["user_id"] == "real-user"
+    assert docs[0]["client_email"] == "u@b.com"
+    _close_sync(sub)
+
+
+def test_documentdb_kwargs_disables_retrywrites_with_tls():
+    # DocumentDB: TLS CA present → retryWrites disabled (DocumentDB rejects it).
+    kw = _documentdb_client_kwargs("mongodb://host:27017", "/etc/ca.pem")
+    assert kw["tls"] is True
+    assert kw["tlsCAFile"] == "/etc/ca.pem"
+    assert kw["retryWrites"] is False
+    # Plain mongo (no CA) → no TLS, driver default retryWrites kept.
+    kw2 = _documentdb_client_kwargs("mongodb://host:27017", None)
+    assert "tls" not in kw2 and "retryWrites" not in kw2
+    # URI that already pins retrywrites → don't override it.
+    kw3 = _documentdb_client_kwargs("mongodb://host:27017/?retryWrites=true", "/ca.pem")
+    assert "retryWrites" not in kw3
