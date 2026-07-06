@@ -20,8 +20,24 @@ from .server import (
     create_inter_service_router,
     inter_service_endpoint
 )
+from .observability import (
+    ObservabilityWriter,
+    ObservabilityError,
+    BatchTooLargeError,
+    InvalidRecordError,
+    validate_batch,
+    llm_trace,
+    tool_call,
+    agent_run,
+    LLM_TRACE,
+    TOOL_CALL,
+    AGENT_RUN,
+    DEFAULT_MAX_RECORDS_PER_BATCH,
+    DEFAULT_WRITE_TIMEOUT_S,
+    DEFAULT_TTL_DAYS,
+)
 
-__version__ = "1.0.4"
+__version__ = "1.1.0"
 
 __all__ = [
     # Client
@@ -35,4 +51,19 @@ __all__ = [
     # Server utilities
     "create_inter_service_router",
     "inter_service_endpoint",
+    # Observability write-client (BLA-1342)
+    "ObservabilityWriter",
+    "ObservabilityError",
+    "BatchTooLargeError",
+    "InvalidRecordError",
+    "validate_batch",
+    "llm_trace",
+    "tool_call",
+    "agent_run",
+    "LLM_TRACE",
+    "TOOL_CALL",
+    "AGENT_RUN",
+    "DEFAULT_MAX_RECORDS_PER_BATCH",
+    "DEFAULT_WRITE_TIMEOUT_S",
+    "DEFAULT_TTL_DAYS",
 ]
