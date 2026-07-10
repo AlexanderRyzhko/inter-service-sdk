@@ -11,7 +11,7 @@ long_description = (this_directory / "README.md").read_text(encoding="utf-8")
 
 setup(
     name="inter-service-sdk",
-    version="1.2.0",
+    version="1.3.0",
     author="Blazel",
     author_email="dev@blazel.com",
     description="Complete framework for inter-service communication with client, server utilities, auth and encryption",
@@ -52,7 +52,9 @@ setup(
             "pytest>=7.4.0",
             "pytest-cov>=4.1.0",
             "pytest-mock>=3.11.1",
+            "pytest-asyncio>=0.21.0",
             "requests-mock>=1.11.0",
+            "httpx>=0.24.0",
             "black>=23.0.0",
             "flake8>=6.1.0",
             "mypy>=1.5.0",

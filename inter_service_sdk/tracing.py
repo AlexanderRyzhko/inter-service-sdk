@@ -1,0 +1,90 @@
+"""
+Canonical trace-id propagation for inter-service requests (BLA-1463 slice 3 contract).
+
+Provides:
+- TRACE_HEADER / trace_id_var / get_trace_id() / set_trace_id(): shared accessors
+- BlazelTracingMiddleware: pure ASGI middleware (NOT starlette.middleware.base.BaseHTTPMiddleware).
+  BaseHTTPMiddleware runs the wrapped app in a separate anyio task, which breaks contextvar
+  propagation and caused the ordering bug fixed in BLA-1471 (CGAPI AuditMiddleware). A pure
+  ASGI implementation keeps the whole request in one task, so that bug class is structurally
+  impossible here.
+- BlazelTraceFilter: stdlib logging filter injecting record.blazel_trace_id
+"""
+
+import logging
+import uuid
+from contextvars import ContextVar
+from typing import Optional
+
+TRACE_HEADER = "X-Blazel-Trace-Id"
+REQUEST_ID_HEADER = "X-Request-ID"
+
+trace_id_var: ContextVar[Optional[str]] = ContextVar("blazel_trace_id", default=None)
+
+
+def get_trace_id() -> Optional[str]:
+    """Return the trace id for the current context, or None if unset."""
+    return trace_id_var.get()
+
+
+def set_trace_id(trace_id: Optional[str]):
+    """Set the trace id for the current context. Returns the ContextVar reset Token."""
+    return trace_id_var.set(trace_id)
+
+
+def _decode_scope_headers(raw_headers):
+    decoded = {}
+    for name, value in raw_headers:
+        decoded[name.decode("latin-1").lower()] = value.decode("latin-1")
+    return decoded
+
+
+class BlazelTracingMiddleware:
+    """Pure ASGI middleware — assigns/propagates blazel_trace_id for the request lifecycle."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        headers = _decode_scope_headers(scope.get("headers", []))
+        incoming_trace = headers.get(TRACE_HEADER.lower())
+        incoming_request_id = headers.get(REQUEST_ID_HEADER.lower())
+
+        if incoming_trace:
+            trace_id = incoming_trace
+        elif incoming_request_id:
+            trace_id = incoming_request_id
+        else:
+            trace_id = str(uuid.uuid4())
+
+        token = trace_id_var.set(trace_id)
+
+        async def send_wrapper(message):
+            if message["type"] == "http.response.start":
+                response_headers = list(message.get("headers", []))
+                response_headers.append((TRACE_HEADER.encode("latin-1"), trace_id.encode("latin-1")))
+                if incoming_request_id:
+                    response_headers.append(
+                        (REQUEST_ID_HEADER.encode("latin-1"), incoming_request_id.encode("latin-1"))
+                    )
+                message = {**message, "headers": response_headers}
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_wrapper)
+        finally:
+            trace_id_var.reset(token)
+
+
+class BlazelTraceFilter(logging.Filter):
+    """Attach to a logger so every record carries blazel_trace_id (safe default when unset)."""
+
+    default_value = "-"
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.blazel_trace_id = get_trace_id() or self.default_value
+        return True

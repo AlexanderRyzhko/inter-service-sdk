@@ -1,91 +1,195 @@
-"""Test skeletons for BLA-1504: BlazelTracingMiddleware + client-side trace-id injection.
-From Production E2E Matrix — implementation targets.
 """
+Tests for inter_service_sdk.tracing module (BLA-1504).
+"""
+import asyncio
+import inspect
+import logging
+import uuid
+
+import httpx
 import pytest
+import requests_mock
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from starlette.middleware.base import BaseHTTPMiddleware
+
+from inter_service_sdk import InterServiceClient
+from inter_service_sdk.tracing import (
+    TRACE_HEADER,
+    REQUEST_ID_HEADER,
+    trace_id_var,
+    get_trace_id,
+    set_trace_id,
+    BlazelTracingMiddleware,
+    BlazelTraceFilter,
+)
+
+
+@pytest.fixture(autouse=True)
+def _reset_trace_id():
+    """Ensure trace_id_var never leaks between tests in this module."""
+    token = trace_id_var.set(None)
+    yield
+    trace_id_var.reset(token)
+
+
+def _make_app():
+    app = FastAPI()
+    app.add_middleware(BlazelTracingMiddleware)
+
+    @app.get("/echo")
+    async def echo():
+        return {"trace_id": get_trace_id()}
+
+    return app
 
 
 class TestTraceIdPrimitives:
 
-    @pytest.mark.skip(reason="BLA-1504: not implemented yet")
     def test_get_trace_id_default_none(self):
         """AC-1: no trace id set -> get_trace_id() returns None, no raise."""
-        assert False, "TODO"
+        assert get_trace_id() is None
 
-    @pytest.mark.skip(reason="BLA-1504: not implemented yet")
     def test_set_then_get_trace_id(self):
         """AC-2: set_trace_id('abc') -> get_trace_id() == 'abc' in same context."""
-        assert False, "TODO"
+        set_trace_id("abc")
+        assert get_trace_id() == "abc"
 
-    @pytest.mark.skip(reason="BLA-1504: not implemented yet")
     def test_trace_header_constant_value(self):
         """AC-3: TRACE_HEADER == 'X-Blazel-Trace-Id' exactly."""
-        assert False, "TODO"
+        assert TRACE_HEADER == "X-Blazel-Trace-Id"
 
 
 class TestBlazelTracingMiddleware:
 
-    @pytest.mark.skip(reason="BLA-1504: not implemented yet")
     def test_middleware_uses_incoming_trace_header(self):
         """AC-4: X-Blazel-Trace-Id: t1 inbound -> trace id t1, echoed on response."""
-        assert False, "TODO"
+        client = TestClient(_make_app())
+        resp = client.get("/echo", headers={TRACE_HEADER: "t1"})
+        assert resp.json()["trace_id"] == "t1"
+        assert resp.headers[TRACE_HEADER] == "t1"
 
-    @pytest.mark.skip(reason="BLA-1504: not implemented yet")
     def test_middleware_falls_back_to_request_id(self):
         """AC-5: no X-Blazel-Trace-Id but X-Request-ID: r1 -> trace id r1, both headers echoed."""
-        assert False, "TODO"
+        client = TestClient(_make_app())
+        resp = client.get("/echo", headers={REQUEST_ID_HEADER: "r1"})
+        assert resp.json()["trace_id"] == "r1"
+        assert resp.headers[TRACE_HEADER] == "r1"
+        assert resp.headers[REQUEST_ID_HEADER] == "r1"
 
-    @pytest.mark.skip(reason="BLA-1504: not implemented yet")
     def test_middleware_mints_uuid4_when_absent(self):
         """AC-6: neither header present -> uuid4 minted, echoed as X-Blazel-Trace-Id."""
-        assert False, "TODO"
+        client = TestClient(_make_app())
+        resp = client.get("/echo")
+        trace_id = resp.json()["trace_id"]
+        assert trace_id is not None
+        uuid.UUID(trace_id)  # raises ValueError if not a valid uuid4-shaped string
+        assert resp.headers[TRACE_HEADER] == trace_id
 
-    @pytest.mark.skip(reason="BLA-1504: not implemented yet")
     def test_middleware_is_pure_asgi_call(self):
         """AC-7: middleware implements async def __call__(scope, receive, send) directly,
         does NOT subclass starlette.middleware.base.BaseHTTPMiddleware."""
-        assert False, "TODO"
+        assert not issubclass(BlazelTracingMiddleware, BaseHTTPMiddleware)
+        assert inspect.iscoroutinefunction(BlazelTracingMiddleware.__call__)
+        params = list(inspect.signature(BlazelTracingMiddleware.__call__).parameters)
+        assert params == ["self", "scope", "receive", "send"]
 
-    @pytest.mark.skip(reason="BLA-1504: not implemented yet")
     async def test_middleware_no_cross_request_bleed(self):
-        """AC-8: two concurrent requests, different trace ids, no cross-request bleed.
-        Must use httpx.AsyncClient + ASGITransport + asyncio.gather with real overlap
-        (TestClient is serialized and would pass vacuously) — see design review should-fix 2."""
-        assert False, "TODO"
+        """AC-8: two genuinely concurrent in-flight requests, different trace ids ->
+        no cross-request contextvar bleed. Uses httpx.AsyncClient + ASGITransport with
+        an event handshake to force real overlap (TestClient is serialized and would
+        pass this vacuously — see design review should-fix 2)."""
+        app = FastAPI()
+        app.add_middleware(BlazelTracingMiddleware)
+
+        first_arrived = asyncio.Event()
+        release_first = asyncio.Event()
+
+        @app.get("/slow")
+        async def slow(which: str):
+            if which == "first":
+                first_arrived.set()
+                await release_first.wait()
+            else:
+                await first_arrived.wait()
+                release_first.set()
+            return {"trace_id": get_trace_id()}
+
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            t1 = asyncio.create_task(
+                ac.get("/slow", params={"which": "first"}, headers={TRACE_HEADER: "trace-1"})
+            )
+            t2 = asyncio.create_task(
+                ac.get("/slow", params={"which": "second"}, headers={TRACE_HEADER: "trace-2"})
+            )
+            r1, r2 = await asyncio.wait_for(asyncio.gather(t1, t2), timeout=5)
+
+        assert r1.json()["trace_id"] == "trace-1"
+        assert r2.json()["trace_id"] == "trace-2"
 
 
 class TestBlazelTraceFilter:
 
-    @pytest.mark.skip(reason="BLA-1504: not implemented yet")
     def test_trace_filter_injects_field_when_set(self):
         """AC-9: trace id set in context -> record.blazel_trace_id equals it."""
-        assert False, "TODO"
+        set_trace_id("abc123")
+        record = logging.LogRecord("test", logging.INFO, __file__, 1, "msg", None, None)
+        f = BlazelTraceFilter()
+        assert f.filter(record) is True
+        assert record.blazel_trace_id == "abc123"
 
-    @pytest.mark.skip(reason="BLA-1504: not implemented yet")
     def test_trace_filter_safe_default_when_unset(self):
         """AC-10: no trace id set -> record.blazel_trace_id present with safe default,
         formatter referencing %(blazel_trace_id)s never raises KeyError."""
-        assert False, "TODO"
+        record = logging.LogRecord("test", logging.INFO, __file__, 1, "msg", None, None)
+        f = BlazelTraceFilter()
+        f.filter(record)
+        assert record.blazel_trace_id == BlazelTraceFilter.default_value
+        formatter = logging.Formatter("%(blazel_trace_id)s %(message)s")
+        formatter.format(record)  # must not raise KeyError
 
 
 class TestClientInjectionFromSyncRouteHandler:
 
-    @pytest.mark.skip(reason="BLA-1504: not implemented yet — Delivery Unknown")
     def test_client_injection_from_sync_route_handler(self):
         """AC-14 (Delivery Unknown): sync (def, not async def) FastAPI route handler
         calls client.request() after middleware set the context var -> trace id still
-        propagates into outbound header. Must resolve before PR review."""
-        assert False, "TODO"
+        propagates into outbound header. Starlette runs sync routes via
+        anyio.to_thread.run_sync, which copies context — this proves it holds here."""
+        app = FastAPI()
+        app.add_middleware(BlazelTracingMiddleware)
+
+        captured = {}
+
+        @app.get("/proxy")
+        def proxy():  # sync def, intentionally not async
+            client = InterServiceClient(base_url="http://downstream.example.com", api_key="k")
+            with requests_mock.Mocker() as m:
+                m.get(requests_mock.ANY, json={"data": {}})
+                client.request(endpoint="ping")
+                captured["headers"] = m.request_history[0].headers
+            return {"ok": True}
+
+        test_client = TestClient(app)
+        resp = test_client.get("/proxy", headers={TRACE_HEADER: "sync-trace"})
+        assert resp.status_code == 200
+        assert captured["headers"].get(TRACE_HEADER) == "sync-trace"
 
 
 class TestVersionAndExports:
 
-    @pytest.mark.skip(reason="BLA-1504: not implemented yet")
     def test_version_is_1_3_0(self):
         """AC-15: inter_service_sdk.__version__ == '1.3.0'."""
-        assert False, "TODO"
+        import inter_service_sdk
+        assert inter_service_sdk.__version__ == "1.3.0"
 
-    @pytest.mark.skip(reason="BLA-1504: not implemented yet")
     def test_tracing_symbols_exported_from_top_level(self):
         """AC-15: TRACE_HEADER, get_trace_id, set_trace_id, BlazelTracingMiddleware,
         BlazelTraceFilter all importable from inter_service_sdk top-level."""
-        assert False, "TODO"
+        import inter_service_sdk
+        assert inter_service_sdk.TRACE_HEADER == "X-Blazel-Trace-Id"
+        assert inter_service_sdk.get_trace_id is get_trace_id
+        assert inter_service_sdk.set_trace_id is set_trace_id
+        assert inter_service_sdk.BlazelTracingMiddleware is BlazelTracingMiddleware
+        assert inter_service_sdk.BlazelTraceFilter is BlazelTraceFilter

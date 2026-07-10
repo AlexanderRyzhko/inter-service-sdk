@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "inter-service-sdk"
-version = "1.2.0"
+version = "1.3.0"
 authors = [
     {name = "Blazel", email = "dev@blazel.com"}
 ]
@@ -58,6 +58,7 @@ dev = [
     "pytest-mock>=3.11.1",
     "pytest-asyncio>=0.21.0",
     "requests-mock>=1.11.0",
+    "httpx>=0.24.0",
     "black>=23.0.0",
     "flake8>=6.1.0",
     "mypy>=1.5.0",
