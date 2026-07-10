@@ -489,3 +489,25 @@ class TestClientResponseFormats:
             assert "status_code" in response
             assert "error" in response
             assert response["status"] in ["success", "error"]
+
+
+class TestClientTraceIdInjection:
+    """BLA-1504: client-side trace-id auto-injection."""
+
+    @pytest.mark.skip(reason="BLA-1504: not implemented yet")
+    def test_request_injects_trace_id_when_context_var_set(self, client):
+        """AC-11: trace_id_var set, caller doesn't pass header -> outbound request
+        includes X-Blazel-Trace-Id equal to current trace id."""
+        assert False, "TODO"
+
+    @pytest.mark.skip(reason="BLA-1504: not implemented yet")
+    def test_request_explicit_header_not_overwritten(self, client):
+        """AC-12: caller passes headers={'X-Blazel-Trace-Id': 'explicit'} -> outbound
+        header is 'explicit', never overwritten by context var."""
+        assert False, "TODO"
+
+    @pytest.mark.skip(reason="BLA-1504: not implemented yet")
+    def test_request_no_header_when_trace_id_unset(self, client):
+        """AC-13: trace_id_var never set -> no X-Blazel-Trace-Id header added,
+        fully backward-compatible no-op."""
+        assert False, "TODO"
