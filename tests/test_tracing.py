@@ -114,6 +114,63 @@ class TestBlazelTracingMiddleware:
         assert raw_trace == [b"r1"]
         assert raw_rid == [b"r1"]
 
+    def test_middleware_strips_downstream_request_id_even_when_not_echoing_one(self):
+        """Regression (PR #6 review round 2 finding): if inbound had ONLY
+        X-Blazel-Trace-Id (no X-Request-ID) but the downstream app set its own
+        X-Request-ID, the response must not carry two conflicting correlation
+        ids — the downstream X-Request-ID must be stripped."""
+        from starlette.responses import Response
+
+        app = FastAPI()
+        app.add_middleware(BlazelTracingMiddleware)
+
+        @app.get("/preset")
+        async def preset():
+            return Response(
+                content="{}",
+                media_type="application/json",
+                headers={REQUEST_ID_HEADER: "downstream-rid"},
+            )
+
+        client = TestClient(app)
+        resp = client.get("/preset", headers={TRACE_HEADER: "trace-123"})
+        assert resp.headers[TRACE_HEADER] == "trace-123"
+        assert REQUEST_ID_HEADER not in resp.headers
+
+    def test_middleware_add_middleware_pattern_misses_unhandled_500(self):
+        """Documents a known limitation (PR #6 review round 2 finding): Starlette's
+        ServerErrorMiddleware is always outermost regardless of app.add_middleware()
+        order, so a truly unhandled exception never reaches send_wrapper — the 500
+        response has no trace header with this integration pattern."""
+        app = FastAPI()
+        app.add_middleware(BlazelTracingMiddleware)
+
+        @app.get("/boom")
+        async def boom():
+            raise ValueError("kaboom")
+
+        client = TestClient(app, raise_server_exceptions=False)
+        resp = client.get("/boom", headers={TRACE_HEADER: "t1"})
+        assert resp.status_code == 500
+        assert TRACE_HEADER not in resp.headers  # documents the gap, not the desired end state
+
+    def test_middleware_outer_wrap_pattern_covers_unhandled_500(self):
+        """Counterpart to the above: wrapping the whole app from OUTSIDE (not via
+        app.add_middleware) puts BlazelTracingMiddleware outside Starlette's own
+        ServerErrorMiddleware, so the trace header IS present even on an unhandled
+        exception's 500 response. This is the recommended pattern for full coverage."""
+        app = FastAPI()
+
+        @app.get("/boom")
+        async def boom():
+            raise ValueError("kaboom")
+
+        wrapped = BlazelTracingMiddleware(app)
+        client = TestClient(wrapped, raise_server_exceptions=False)
+        resp = client.get("/boom", headers={TRACE_HEADER: "t1"})
+        assert resp.status_code == 500
+        assert resp.headers[TRACE_HEADER] == "t1"
+
     def test_middleware_is_pure_asgi_call(self):
         """AC-7: middleware implements async def __call__(scope, receive, send) directly,
         does NOT subclass starlette.middleware.base.BaseHTTPMiddleware."""

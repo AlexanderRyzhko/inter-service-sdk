@@ -9,6 +9,19 @@ Provides:
   ASGI implementation keeps the whole request in one task, so that bug class is structurally
   impossible here.
 - BlazelTraceFilter: stdlib logging filter injecting record.blazel_trace_id
+
+Known limitation (Starlette architecture, not fixable within this middleware): Starlette
+always wraps the whole app with its own ServerErrorMiddleware as the OUTERMOST layer,
+regardless of `app.add_middleware()` order (see starlette.applications.Starlette.
+build_middleware_stack). A truly unhandled exception (not an HTTPException) propagates
+past this middleware and is turned into a 500 response by ServerErrorMiddleware using the
+original `send`, never reaching our `send_wrapper` — so the trace header is missing on
+that specific response. Installing via `app.add_middleware(BlazelTracingMiddleware)` does
+NOT cover this case. To get trace headers on unhandled-exception 500s too, wrap the whole
+app from outside instead: `asgi_app = BlazelTracingMiddleware(fastapi_app)` and serve
+`asgi_app` directly — that puts BlazelTracingMiddleware outside Starlette's own
+ServerErrorMiddleware. See test_middleware_add_middleware_pattern_misses_unhandled_500 /
+test_middleware_outer_wrap_pattern_covers_unhandled_500 in tests/test_tracing.py.
 """
 
 import logging
@@ -51,7 +64,12 @@ def _without_headers(raw_headers, names_lower):
 
 
 class BlazelTracingMiddleware:
-    """Pure ASGI middleware — assigns/propagates blazel_trace_id for the request lifecycle."""
+    """Pure ASGI middleware — assigns/propagates blazel_trace_id for the request lifecycle.
+
+    See module docstring: `app.add_middleware(BlazelTracingMiddleware)` cannot add the
+    trace header to unhandled-exception 500 responses (Starlette's ServerErrorMiddleware
+    is always outermost). Wrap the whole app instead for full crash-response coverage.
+    """
 
     def __init__(self, app):
         self.app = app
@@ -76,9 +94,10 @@ class BlazelTracingMiddleware:
 
         async def send_wrapper(message):
             if message["type"] == "http.response.start":
-                names_to_replace = {TRACE_HEADER.lower()}
-                if incoming_request_id:
-                    names_to_replace.add(REQUEST_ID_HEADER.lower())
+                # Always strip any pre-existing values for both header names — a downstream
+                # X-Request-ID left untouched here would let two different correlation ids
+                # reach the client on the same response.
+                names_to_replace = {TRACE_HEADER.lower(), REQUEST_ID_HEADER.lower()}
                 response_headers = _without_headers(message.get("headers", []), names_to_replace)
                 response_headers.append((TRACE_HEADER.encode("latin-1"), trace_id.encode("latin-1")))
                 if incoming_request_id:
