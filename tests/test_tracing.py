@@ -86,6 +86,34 @@ class TestBlazelTracingMiddleware:
         uuid.UUID(trace_id)  # raises ValueError if not a valid uuid4-shaped string
         assert resp.headers[TRACE_HEADER] == trace_id
 
+    def test_middleware_no_duplicate_response_headers_when_downstream_presets_them(self):
+        """Regression (PR #6 review finding): if the wrapped app already set
+        X-Blazel-Trace-Id / X-Request-ID on the response, the middleware must
+        replace them, not append a duplicate (which HTTP clients would see as
+        a comma-joined value)."""
+        from starlette.responses import Response
+
+        app = FastAPI()
+        app.add_middleware(BlazelTracingMiddleware)
+
+        @app.get("/preset")
+        async def preset():
+            return Response(
+                content="{}",
+                media_type="application/json",
+                headers={TRACE_HEADER: "downstream-value", REQUEST_ID_HEADER: "downstream-rid"},
+            )
+
+        client = TestClient(app)
+        resp = client.get("/preset", headers={REQUEST_ID_HEADER: "r1"})
+        assert resp.headers[TRACE_HEADER] == "r1"
+        assert resp.headers[REQUEST_ID_HEADER] == "r1"
+        # raw_headers exposes duplicates that .headers (a dict-like) would hide
+        raw_trace = [v for k, v in resp.headers.raw if k.decode().lower() == TRACE_HEADER.lower()]
+        raw_rid = [v for k, v in resp.headers.raw if k.decode().lower() == REQUEST_ID_HEADER.lower()]
+        assert raw_trace == [b"r1"]
+        assert raw_rid == [b"r1"]
+
     def test_middleware_is_pure_asgi_call(self):
         """AC-7: middleware implements async def __call__(scope, receive, send) directly,
         does NOT subclass starlette.middleware.base.BaseHTTPMiddleware."""

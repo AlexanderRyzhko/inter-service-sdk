@@ -39,6 +39,17 @@ def _decode_scope_headers(raw_headers):
     return decoded
 
 
+def _without_headers(raw_headers, names_lower):
+    """Drop any existing tuples matching names_lower (case-insensitive) so the
+    canonical value set below is never duplicated (e.g. by a wrapped app that
+    already set X-Blazel-Trace-Id or X-Request-ID itself)."""
+    return [
+        (name, value)
+        for name, value in raw_headers
+        if name.decode("latin-1").lower() not in names_lower
+    ]
+
+
 class BlazelTracingMiddleware:
     """Pure ASGI middleware — assigns/propagates blazel_trace_id for the request lifecycle."""
 
@@ -65,7 +76,10 @@ class BlazelTracingMiddleware:
 
         async def send_wrapper(message):
             if message["type"] == "http.response.start":
-                response_headers = list(message.get("headers", []))
+                names_to_replace = {TRACE_HEADER.lower()}
+                if incoming_request_id:
+                    names_to_replace.add(REQUEST_ID_HEADER.lower())
+                response_headers = _without_headers(message.get("headers", []), names_to_replace)
                 response_headers.append((TRACE_HEADER.encode("latin-1"), trace_id.encode("latin-1")))
                 if incoming_request_id:
                     response_headers.append(
