@@ -69,10 +69,27 @@ class BlazelTracingMiddleware:
     See module docstring: `app.add_middleware(BlazelTracingMiddleware)` cannot add the
     trace header to unhandled-exception 500 responses (Starlette's ServerErrorMiddleware
     is always outermost). Wrap the whole app instead for full crash-response coverage.
+
+    exclude_paths (BLA-1497): request paths for which the response-header
+    rewrite is skipped. trace_id_var is STILL set for these paths (so their log
+    records carry blazel_trace_id), but the middleware leaves the response
+    headers untouched — it does not add X-Blazel-Trace-Id and does not strip an
+    app-set X-Request-Id. Use this for endpoints that own a pre-existing
+    correlation-header contract the middleware would otherwise clobber (e.g. a
+    route that mints and echoes its own X-Request-Id when the caller sends none).
+    A path is excluded when it exactly equals, starts with, or ends with any
+    entry (so `exclude_paths=['/learn']` matches `/api/v1/.../{email}/learn`).
     """
 
-    def __init__(self, app):
+    def __init__(self, app, exclude_paths=None):
         self.app = app
+        self.exclude_paths = tuple(exclude_paths or ())
+
+    def _is_excluded(self, path: str) -> bool:
+        for entry in self.exclude_paths:
+            if path == entry or path.startswith(entry) or path.endswith(entry):
+                return True
+        return False
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
@@ -91,6 +108,15 @@ class BlazelTracingMiddleware:
             trace_id = str(uuid.uuid4())
 
         token = trace_id_var.set(trace_id)
+
+        # BLA-1497: excluded paths get the trace_id in context (for logging) but
+        # keep their own response-header contract — no strip, no rewrite.
+        if self._is_excluded(scope.get("path", "")):
+            try:
+                await self.app(scope, receive, send)
+            finally:
+                trace_id_var.reset(token)
+            return
 
         async def send_wrapper(message):
             if message["type"] == "http.response.start":

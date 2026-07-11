@@ -11,7 +11,7 @@ long_description = (this_directory / "README.md").read_text(encoding="utf-8")
 
 setup(
     name="inter-service-sdk",
-    version="1.3.0",
+    version="1.3.1",
     author="Blazel",
     author_email="dev@blazel.com",
     description="Complete framework for inter-service communication with client, server utilities, auth and encryption",
