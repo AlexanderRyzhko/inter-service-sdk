@@ -12,6 +12,7 @@ from requests.exceptions import RequestException, Timeout
 from .utils import build_url
 from .exceptions import AuthenticationError, RequestError
 from . import crypto
+from .tracing import trace_id_var, TRACE_HEADER
 
 logger = logging.getLogger(__name__)
 
@@ -180,6 +181,13 @@ class InterServiceClient:
 
         if headers:
             request_headers.update(headers)
+
+        # BLA-1504: auto-inject trace id when set and caller didn't already pass it
+        # (case-insensitive check — request_headers may be a plain dict, not requests'
+        # CaseInsensitiveDict, when connection pooling is disabled)
+        current_trace_id = trace_id_var.get()
+        if current_trace_id and not any(k.lower() == TRACE_HEADER.lower() for k in request_headers):
+            request_headers[TRACE_HEADER] = current_trace_id
 
         # Make request with retry logic
         for attempt in range(self.retry_attempts):
