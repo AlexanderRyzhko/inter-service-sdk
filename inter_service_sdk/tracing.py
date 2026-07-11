@@ -100,7 +100,12 @@ class BlazelTracingMiddleware:
                 names_to_replace = {TRACE_HEADER.lower(), REQUEST_ID_HEADER.lower()}
                 response_headers = _without_headers(message.get("headers", []), names_to_replace)
                 response_headers.append((TRACE_HEADER.encode("latin-1"), trace_id.encode("latin-1")))
-                if incoming_request_id:
+                # Only echo X-Request-ID when it's exactly the value that became the
+                # canonical trace id (the AC-5 fallback case). If the caller sent both
+                # headers with DIFFERENT values, X-Blazel-Trace-Id already won precedence
+                # above — echoing the original, now-stale X-Request-ID back would put two
+                # conflicting correlation ids on the same response.
+                if incoming_request_id and incoming_request_id == trace_id:
                     response_headers.append(
                         (REQUEST_ID_HEADER.encode("latin-1"), incoming_request_id.encode("latin-1"))
                     )

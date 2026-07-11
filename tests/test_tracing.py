@@ -86,6 +86,25 @@ class TestBlazelTracingMiddleware:
         uuid.UUID(trace_id)  # raises ValueError if not a valid uuid4-shaped string
         assert resp.headers[TRACE_HEADER] == trace_id
 
+    def test_middleware_mismatched_dual_inbound_headers_no_conflicting_response_ids(self):
+        """Regression (PR #6 review round 3 finding): if the caller sends BOTH
+        X-Blazel-Trace-Id and X-Request-ID with DIFFERENT values, X-Blazel-Trace-Id
+        wins precedence (AC-4) — the now-stale, non-matching X-Request-ID must not
+        be echoed back, or the response would carry two conflicting correlation ids."""
+        client = TestClient(_make_app())
+        resp = client.get("/echo", headers={TRACE_HEADER: "trace-1", REQUEST_ID_HEADER: "rid-2"})
+        assert resp.json()["trace_id"] == "trace-1"
+        assert resp.headers[TRACE_HEADER] == "trace-1"
+        assert REQUEST_ID_HEADER not in resp.headers
+
+    def test_middleware_matching_dual_inbound_headers_echoes_request_id(self):
+        """Same-value case: both headers present with the SAME value -> both echoed
+        (no mismatch to guard against)."""
+        client = TestClient(_make_app())
+        resp = client.get("/echo", headers={TRACE_HEADER: "same-id", REQUEST_ID_HEADER: "same-id"})
+        assert resp.headers[TRACE_HEADER] == "same-id"
+        assert resp.headers[REQUEST_ID_HEADER] == "same-id"
+
     def test_middleware_no_duplicate_response_headers_when_downstream_presets_them(self):
         """Regression (PR #6 review finding): if the wrapped app already set
         X-Blazel-Trace-Id / X-Request-ID on the response, the middleware must
