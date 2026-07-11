@@ -52,7 +52,7 @@ def increment_version(version_str):
     return version_str
 
 def update_version_in_files(new_version):
-    """Update version in both pyproject.toml and __init__.py"""
+    """Update version in pyproject.toml, __init__.py, and setup.py"""
     # Update pyproject.toml
     with open("pyproject.toml", "r") as f:
         content = f.read()
@@ -83,7 +83,23 @@ def update_version_in_files(new_version):
         with open(init_file, "w") as f:
             f.write('\n'.join(lines))
 
-    print_colored(f"✅ Updated version to {new_version} in pyproject.toml and __init__.py", GREEN)
+    # Update setup.py (BLA-1504: was previously left stuck at old version)
+    setup_file = Path("setup.py")
+    if setup_file.exists():
+        with open(setup_file, "r") as f:
+            content = f.read()
+
+        lines = content.split('\n')
+        for i, line in enumerate(lines):
+            if line.strip().startswith("version="):
+                indent = line[:len(line) - len(line.lstrip())]
+                lines[i] = f'{indent}version="{new_version}",'
+                break
+
+        with open(setup_file, "w") as f:
+            f.write('\n'.join(lines))
+
+    print_colored(f"✅ Updated version to {new_version} in pyproject.toml, __init__.py, and setup.py", GREEN)
 
 def update_dependent_projects(new_version):
     """Update requirements.txt in dependent projects"""

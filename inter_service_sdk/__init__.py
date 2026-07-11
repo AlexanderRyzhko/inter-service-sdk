@@ -38,8 +38,15 @@ from .observability import (
     DEFAULT_TTL_DAYS,
     DEFAULT_QUEUE_MAX,
 )
+from .tracing import (
+    TRACE_HEADER,
+    get_trace_id,
+    set_trace_id,
+    BlazelTracingMiddleware,
+    BlazelTraceFilter,
+)
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 __all__ = [
     # Client
@@ -71,4 +78,10 @@ __all__ = [
     "DEFAULT_MAX_RECORDS_PER_BATCH",
     "DEFAULT_WRITE_TIMEOUT_S",
     "DEFAULT_TTL_DAYS",
+    # Tracing (BLA-1504)
+    "TRACE_HEADER",
+    "get_trace_id",
+    "set_trace_id",
+    "BlazelTracingMiddleware",
+    "BlazelTraceFilter",
 ]

@@ -5,10 +5,12 @@ Tests for inter_service_sdk.client module.
 import pytest
 from unittest.mock import Mock, patch, MagicMock
 import requests
+import requests_mock
 from requests.exceptions import Timeout, RequestException
 
 from inter_service_sdk.client import InterServiceClient
 from inter_service_sdk.exceptions import AuthenticationError, RequestError
+from inter_service_sdk.tracing import trace_id_var, set_trace_id, TRACE_HEADER
 
 
 class TestInterServiceClient:
@@ -489,3 +491,49 @@ class TestClientResponseFormats:
             assert "status_code" in response
             assert "error" in response
             assert response["status"] in ["success", "error"]
+
+
+class TestClientTraceIdInjection:
+    """BLA-1504: client-side trace-id auto-injection."""
+
+    @pytest.fixture
+    def client(self):
+        """Create test client (fresh-connection mode, matches default SDK usage)."""
+        return InterServiceClient(
+            base_url="https://api.example.com",
+            api_key="test-api-key",
+            retry_attempts=1
+        )
+
+    @pytest.fixture(autouse=True)
+    def _reset_trace_id(self):
+        """Ensure trace_id_var never leaks between tests in this module."""
+        token = trace_id_var.set(None)
+        yield
+        trace_id_var.reset(token)
+
+    def test_request_injects_trace_id_when_context_var_set(self, client):
+        """AC-11: trace_id_var set, caller doesn't pass header -> outbound request
+        includes X-Blazel-Trace-Id equal to current trace id."""
+        set_trace_id("ctx-trace-1")
+        with requests_mock.Mocker() as m:
+            m.get(requests_mock.ANY, json={"data": {}})
+            client.request(endpoint="ping")
+            assert m.request_history[0].headers[TRACE_HEADER] == "ctx-trace-1"
+
+    def test_request_explicit_header_not_overwritten(self, client):
+        """AC-12: caller passes headers={'X-Blazel-Trace-Id': 'explicit'} -> outbound
+        header is 'explicit', never overwritten by context var."""
+        set_trace_id("ctx-trace-1")
+        with requests_mock.Mocker() as m:
+            m.get(requests_mock.ANY, json={"data": {}})
+            client.request(endpoint="ping", headers={TRACE_HEADER: "explicit"})
+            assert m.request_history[0].headers[TRACE_HEADER] == "explicit"
+
+    def test_request_no_header_when_trace_id_unset(self, client):
+        """AC-13: trace_id_var never set -> no X-Blazel-Trace-Id header added,
+        fully backward-compatible no-op."""
+        with requests_mock.Mocker() as m:
+            m.get(requests_mock.ANY, json={"data": {}})
+            client.request(endpoint="ping")
+            assert TRACE_HEADER not in m.request_history[0].headers
