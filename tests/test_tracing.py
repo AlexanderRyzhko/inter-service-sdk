@@ -232,6 +232,74 @@ class TestBlazelTracingMiddleware:
         assert r1.json()["trace_id"] == "trace-1"
         assert r2.json()["trace_id"] == "trace-2"
 
+    def test_exclude_paths_preserves_app_request_id_and_skips_trace_header(self):
+        """BLA-1497: on an excluded path, the middleware must NOT strip the app's
+        own X-Request-Id response header and must NOT add X-Blazel-Trace-Id — the
+        endpoint keeps its own correlation-header contract intact."""
+        from starlette.responses import Response
+
+        app = FastAPI()
+        app.add_middleware(BlazelTracingMiddleware, exclude_paths=["/learn"])
+
+        @app.get("/api/v1/clients/x/learn")
+        async def learn():
+            # Endpoint mints and echoes its own X-Request-Id (its pre-existing contract).
+            return Response(
+                content="{}",
+                media_type="application/json",
+                headers={REQUEST_ID_HEADER: "app-minted-rid"},
+            )
+
+        client = TestClient(app)
+        resp = client.get("/api/v1/clients/x/learn")
+        # App's own X-Request-Id survives (not stripped).
+        assert resp.headers[REQUEST_ID_HEADER] == "app-minted-rid"
+        # Middleware did not add its own trace header on the excluded path.
+        assert TRACE_HEADER not in resp.headers
+
+    def test_exclude_paths_still_sets_trace_id_var_for_logging(self):
+        """BLA-1497: excluded paths still get trace_id_var set (so their log
+        records carry blazel_trace_id) — only the response-header rewrite is
+        skipped, not the context propagation."""
+        app = FastAPI()
+        app.add_middleware(BlazelTracingMiddleware, exclude_paths=["/learn"])
+
+        @app.get("/api/v1/clients/x/learn")
+        async def learn():
+            return {"trace_id": get_trace_id()}
+
+        client = TestClient(app)
+        resp = client.get("/api/v1/clients/x/learn", headers={TRACE_HEADER: "t-excl-1"})
+        assert resp.json()["trace_id"] == "t-excl-1"
+
+    def test_exclude_paths_does_not_affect_non_excluded_routes(self):
+        """BLA-1497: a route not in exclude_paths keeps full rewrite behavior."""
+        app = FastAPI()
+        app.add_middleware(BlazelTracingMiddleware, exclude_paths=["/learn"])
+
+        @app.get("/echo")
+        async def echo():
+            return {"trace_id": get_trace_id()}
+
+        client = TestClient(app)
+        resp = client.get("/echo", headers={TRACE_HEADER: "t-echo-1"})
+        assert resp.json()["trace_id"] == "t-echo-1"
+        assert resp.headers[TRACE_HEADER] == "t-echo-1"
+
+    def test_exclude_paths_default_empty_is_backward_compatible(self):
+        """BLA-1497: omitting exclude_paths keeps 1.3.0 behavior exactly — every
+        path gets the trace header rewrite."""
+        app = FastAPI()
+        app.add_middleware(BlazelTracingMiddleware)
+
+        @app.get("/anything")
+        async def anything():
+            return {"ok": True}
+
+        client = TestClient(app)
+        resp = client.get("/anything", headers={TRACE_HEADER: "t-bc-1"})
+        assert resp.headers[TRACE_HEADER] == "t-bc-1"
+
 
 class TestBlazelTraceFilter:
 
