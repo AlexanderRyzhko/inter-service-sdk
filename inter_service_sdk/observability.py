@@ -329,7 +329,7 @@ class ObservabilityWriter:
 
         Returns one of:
           * ``"converged"`` — the live index now matches the configured TTL
-          * ``"refused"``   — configured TTL is SHORTER than live; left alone
+          * ``"refused"``   — configured TTL is not LONGER than live; left alone
           * ``"denied"``    — the DB user lacks the ``collMod`` privilege. Permanent:
             retrying on every write would spam the log and the DB for no gain.
           * ``"failed"``    — anything else (outage, timeout, election). Treated as
@@ -341,10 +341,23 @@ class ObservabilityWriter:
         """
         _, _, OperationFailure = self._require_pymongo()
 
+        # Fail CLOSED. Only a provably-widening change is applied: we must have
+        # read a live TTL and it must be shorter than ours. An unreadable value
+        # is not evidence of anything, and an existing received_at index with no
+        # expireAfterSeconds means "never expires" — converging that to a finite
+        # TTL is itself a shrink. Either way, issuing collMod on a guess could
+        # irreversibly delete other writers' documents.
         live = await self._live_ttl_seconds(coll)
-        if live is not None and live > self._ttl_seconds:
+        if live is None:
             logger.warning(
-                "%s TTL index left at %sd: configured ttl_days=%s is SHORTER, and "
+                "%s TTL index left as-is: could not read its live expireAfterSeconds, "
+                "so a widen cannot be proven safe. Will retry on the next write.",
+                coll,
+            )
+            return "failed"
+        if live >= self._ttl_seconds:
+            logger.warning(
+                "%s TTL index left at %sd: configured ttl_days=%s is not longer, and "
                 "shrinking a shared trace collection would delete other writers' "
                 "documents. Apply a reduction deliberately with collMod if intended.",
                 coll, live // 86400, self._ttl_seconds // 86400,
