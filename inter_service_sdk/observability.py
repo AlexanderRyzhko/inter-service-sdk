@@ -302,91 +302,48 @@ class ObservabilityWriter:
     async def _live_ttl_seconds(self, coll: str) -> Optional[int]:
         """``expireAfterSeconds`` of the live ``received_at`` TTL index, or None
         if it can't be read (no index, or the query failed)."""
+        # The spec walk stays INSIDE the try. This runs from inside
+        # ensure_trace_indexes' ``except OperationFailure`` handler, and Python
+        # does not re-dispatch to a sibling ``except`` of the same try — so
+        # anything raised here would escape a method documented as never raising.
         try:
             info = await self._db[coll].index_information()
+            for spec in (info or {}).values():
+                keys = spec.get("key") if isinstance(spec, dict) else None
+                if keys and list(keys)[0][0] == "received_at" and "expireAfterSeconds" in spec:
+                    return int(spec["expireAfterSeconds"])
         except Exception as e:  # noqa: BLE001 — best-effort, never raise
             logger.warning("Could not read index info for %s: %s", coll, e)
-            return None
-        for spec in (info or {}).values():
-            keys = spec.get("key") if isinstance(spec, dict) else None
-            if keys and list(keys)[0][0] == "received_at" and "expireAfterSeconds" in spec:
-                return int(spec["expireAfterSeconds"])
         return None
 
-    async def _collmod_ttl(self, coll: str) -> str:
-        """Converge an existing TTL index to ``self._ttl_seconds`` via ``collMod``.
+    async def _report_stale_ttl(self, coll: str) -> None:
+        """Log an ACTIONABLE error for a TTL index that doesn't match config.
 
-        ``create_index`` cannot mutate ``expireAfterSeconds`` — it raises
-        ``IndexOptionsConflict`` (code 85). Only ``collMod`` can.
+        Deliberately read-only. ``create_index`` cannot mutate
+        ``expireAfterSeconds`` (it raises ``IndexOptionsConflict``, code 85) and
+        only ``collMod`` can — but this library does NOT issue it. These three
+        collections are a SHARED, multi-writer store: a ``collMod`` from any one
+        consumer, including one whose config simply hasn't been updated yet,
+        irreversibly deletes every document older than its own TTL, on data the
+        other writers own. That is not a decision a background write path should
+        make. Applying a TTL change is an operator action, run once per
+        environment with an admin role.
 
-        **Widen-only.** These collections are a SHARED, multi-writer store: every
-        in-VPC service writes the same three collections. Converging downward
-        would let any one consumer — including one whose config simply hasn't
-        been updated yet — irreversibly delete every document older than its own
-        (shorter) TTL, on data the other writers own. So a shrink is refused and
-        logged; only a widen is applied. The narrow retention wins only when an
-        operator sets it deliberately with ``collMod``.
-
-        Returns one of:
-          * ``"converged"`` — the live index now matches the configured TTL
-          * ``"refused"``   — configured TTL is not LONGER than live; left alone
-          * ``"denied"``    — the DB user lacks the ``collMod`` privilege. Permanent:
-            retrying on every write would spam the log and the DB for no gain.
-          * ``"failed"``    — anything else (outage, timeout, election). Treated as
-            transient, so the next write retries.
-
-        A failure is logged at ERROR with the exact command an operator must run —
-        the silent alternative is what let prod sit at 30d while the config said
-        365 (BLA-1753).
+        What this fixes relative to the pre-BLA-1753 behaviour is the *signal*:
+        the old warning ("index already exists with different options") named
+        neither value nor remedy, and prod consequently sat at 30d for the whole
+        life of ``OBSERVABILITY_TRACE_TTL_DAYS=365``. This names live vs
+        configured and the exact command, so it is greppable and alertable.
         """
-        _, _, OperationFailure = self._require_pymongo()
-
-        # Fail CLOSED. Only a provably-widening change is applied: we must have
-        # read a live TTL and it must be shorter than ours. An unreadable value
-        # is not evidence of anything, and an existing received_at index with no
-        # expireAfterSeconds means "never expires" — converging that to a finite
-        # TTL is itself a shrink. Either way, issuing collMod on a guess could
-        # irreversibly delete other writers' documents.
         live = await self._live_ttl_seconds(coll)
-        if live is None:
-            logger.warning(
-                "%s TTL index left as-is: could not read its live expireAfterSeconds, "
-                "so a widen cannot be proven safe. Will retry on the next write.",
-                coll,
-            )
-            return "failed"
-        if live >= self._ttl_seconds:
-            logger.warning(
-                "%s TTL index left at %sd: configured ttl_days=%s is not longer, and "
-                "shrinking a shared trace collection would delete other writers' "
-                "documents. Apply a reduction deliberately with collMod if intended.",
-                coll, live // 86400, self._ttl_seconds // 86400,
-            )
-            return "refused"
-
-        try:
-            await self._db.command({
-                "collMod": coll,
-                "index": {
-                    "keyPattern": {"received_at": 1},
-                    "expireAfterSeconds": self._ttl_seconds,
-                },
-            })
-            logger.info("%s TTL index converged to %ss via collMod", coll, self._ttl_seconds)
-            return "converged"
-        except Exception as e:  # noqa: BLE001 — best-effort, never raise
-            # 13 = Unauthorized. A privilege gap does not heal by itself, so
-            # don't re-attempt it on every write; anything else might.
-            denied = isinstance(e, OperationFailure) and getattr(e, "code", None) == 13
-            logger.error(
-                "%s TTL index is STALE and could not be converged automatically (%s): %s. "
-                "Live retention does NOT match the configured ttl_days=%s. Run manually: "
-                'db.runCommand({collMod: "%s", index: {keyPattern: {received_at: 1}, '
-                "expireAfterSeconds: %s}})",
-                coll, "permission denied" if denied else "will retry on next write",
-                e, self._ttl_seconds // 86400, coll, self._ttl_seconds,
-            )
-            return "denied" if denied else "failed"
+        live_desc = f"{live // 86400}d" if live is not None else "unknown"
+        logger.error(
+            "%s TTL index is STALE: live=%s, configured ttl_days=%s. Retention will "
+            "NOT change until an operator applies it (this library never mutates a "
+            "shared TTL index). Run: db.runCommand({collMod: \"%s\", index: "
+            "{keyPattern: {received_at: 1}, expireAfterSeconds: %s}})",
+            coll, live_desc, self._ttl_seconds // 86400, coll, self._ttl_seconds,
+        )
 
     async def ensure_trace_indexes(self) -> None:
         """Create TTL indexes on the three trace collections (idempotent, best-effort).
@@ -395,8 +352,9 @@ class ObservabilityWriter:
         index-creation failure must not break the write path (docs simply won't
         auto-expire until the index lands).
 
-        If an index already exists with a DIFFERENT TTL, this converges it with
-        ``collMod`` rather than leaving the stale index authoritative.
+        An index that already exists with a DIFFERENT TTL is reported, not
+        rewritten: see :meth:`_report_stale_ttl` for why mutating a shared TTL
+        index is an operator action rather than a library one.
         """
         if self._indexes_ensured:
             return
@@ -408,14 +366,11 @@ class ObservabilityWriter:
                 await self._db[coll].create_index("received_at", expireAfterSeconds=self._ttl_seconds)
             except OperationFailure as e:  # noqa: BLE001 — best-effort, never raise
                 if getattr(e, "code", None) == 85:  # IndexOptionsConflict
-                    # The index exists with a different TTL. create_index can
-                    # never fix that — converge it explicitly. A transient
-                    # convergence failure must NOT latch, or the stale TTL stays
-                    # authoritative for the whole process lifetime; only a
-                    # permission denial is terminal (retrying it every write
-                    # would spam the log and the DB for no gain).
-                    if await self._collmod_ttl(coll) == "failed":
-                        all_handled = False
+                    # Terminal by design: the existing index stays authoritative
+                    # and no retry can change that, so latch and let the logged
+                    # command be the escalation. Re-reporting on every write
+                    # would spam the log and the DB for no gain.
+                    await self._report_stale_ttl(coll)
                 else:
                     all_handled = False
                     logger.warning("Failed to ensure TTL index on %s: %s", coll, e)

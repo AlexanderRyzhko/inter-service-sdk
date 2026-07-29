@@ -398,12 +398,13 @@ def test_submit_explicit_identity_overrides_default():
     _close_sync(sub)
 
 
-# --- TTL index convergence (BLA-1753) --------------------------------------
+
+# --- Stale TTL index reporting (BLA-1753) ----------------------------------
 
 class ConflictingCollection(FakeCollection):
-    """create_index always reports the index exists with a different TTL."""
+    """create_index reports the index exists with different options (code 85)."""
 
-    live_ttl_seconds = None  # set by ConflictingDB
+    live_ttl_seconds = None
     index_info_raises = False
 
     async def create_index(self, *args, **kwargs):
@@ -415,7 +416,9 @@ class ConflictingCollection(FakeCollection):
         if self.index_info_raises:
             raise RuntimeError("connection reset while reading index metadata")
         if self.live_ttl_seconds is None:
-            return {"_id_": {"key": [("_id", 1)]}}
+            # received_at index exists but carries NO expireAfterSeconds.
+            return {"_id_": {"key": [("_id", 1)]},
+                    "received_at_1": {"key": [("received_at", 1)]}}
         return {
             "_id_": {"key": [("_id", 1)]},
             "received_at_1": {
@@ -426,17 +429,15 @@ class ConflictingCollection(FakeCollection):
 
 
 class ConflictingDB(FakeDB):
-    """FakeDB whose collections conflict on create_index; records ``command``.
+    """FakeDB whose collections conflict on create_index.
 
-    ``collmod_fails`` is one of None (succeed), "denied" (OperationFailure 13 —
-    permanent) or "transient" (anything else).
+    ``command`` is present and recorded ONLY so a test can prove the writer
+    never calls it — mutating a shared TTL index is an operator action.
     """
 
-    def __init__(self, *, collmod_fails=None, live_ttl_seconds=None,
-                 index_info_raises=False):
+    def __init__(self, *, live_ttl_seconds=None, index_info_raises=False):
         super().__init__()
         self.commands = []
-        self._collmod_fails = collmod_fails
         self._live_ttl_seconds = live_ttl_seconds
         self._index_info_raises = index_info_raises
 
@@ -449,124 +450,87 @@ class ConflictingDB(FakeDB):
         return self._colls[name]
 
     async def command(self, spec):
-        from pymongo.errors import OperationFailure
-
         self.commands.append(spec)
-        if self._collmod_fails == "denied":
-            raise OperationFailure("not authorized on post_scaffolds to execute collMod", 13)
-        if self._collmod_fails == "transient":
-            raise RuntimeError("connection reset by peer")
         return {"ok": 1}
 
 
 @pytest.mark.asyncio
-async def test_ttl_conflict_converges_existing_index_via_collmod():
-    # A pre-existing index with a different TTL must be MUTATED, not left stale —
-    # create_index can never change expireAfterSeconds (BLA-1753 drift bug).
-    db = ConflictingDB(live_ttl_seconds=30 * 86400)
-    writer = ObservabilityWriter(db, ttl_days=1825)
-    await writer.ensure_trace_indexes()
+@pytest.mark.parametrize("live_ttl_seconds, index_info_raises", [
+    (30 * 86400, False),      # live shorter than configured (a "widen")
+    (1825 * 86400, False),    # live longer than configured (a "shrink")
+    (None, False),            # received_at index with no expireAfterSeconds
+    (30 * 86400, True),       # live value unreadable
+])
+async def test_stale_ttl_is_never_mutated_by_the_writer(live_ttl_seconds, index_info_raises):
+    """The writer NEVER issues collMod, in any direction, under any state.
 
-    assert [c["collMod"] for c in db.commands] == [LLM_TRACES, TOOL_CALLS, AGENT_RUNS]
-    for cmd in db.commands:
-        assert cmd["index"]["keyPattern"] == {"received_at": 1}
-        assert cmd["index"]["expireAfterSeconds"] == 1825 * 86400
-
-
-@pytest.mark.asyncio
-async def test_ttl_shrink_is_refused_on_the_shared_store():
-    # These collections are shared by every in-VPC writer. A consumer whose
-    # config still says 30d must NOT converge a live 5y index down to 30d —
-    # that irreversibly deletes other writers' documents.
-    db = ConflictingDB(live_ttl_seconds=1825 * 86400)
-    writer = ObservabilityWriter(db, ttl_days=30)
-    await writer.ensure_trace_indexes()
-    assert db.commands == []  # no collMod issued at all
-
-
-@pytest.mark.asyncio
-async def test_ttl_unreadable_live_value_fails_closed_no_collmod():
-    # The guard must not be fail-OPEN: if the live TTL can't be read, a widen
-    # cannot be proven, so no collMod is issued at all. Otherwise a metadata
-    # read blip re-opens the shrink path on the shared store.
-    db = ConflictingDB(live_ttl_seconds=1825 * 86400, index_info_raises=True)
-    writer = ObservabilityWriter(db, ttl_days=30)
-    await writer.ensure_trace_indexes()
-    assert db.commands == []
-    # unreadable is treated as transient, so it retries rather than latching
-    assert writer._indexes_ensured is False
-
-
-@pytest.mark.asyncio
-async def test_ttl_index_without_expiry_is_not_shrunk_to_finite():
-    # A received_at index carrying no expireAfterSeconds means "never expires".
-    # Converging it to a finite TTL is a shrink from infinity — refuse it.
-    db = ConflictingDB(live_ttl_seconds=None)
+    These collections are shared by every in-VPC writer; a collMod from one
+    consumer deletes documents the others own. Applying a TTL change is an
+    operator action. Widening was briefly automated during review and produced
+    two data-loss defects, so this asserts the absence of the write itself
+    rather than the correctness of a guard around it.
+    """
+    db = ConflictingDB(live_ttl_seconds=live_ttl_seconds,
+                       index_info_raises=index_info_raises)
     writer = ObservabilityWriter(db, ttl_days=1825)
     await writer.ensure_trace_indexes()
     assert db.commands == []
 
 
 @pytest.mark.asyncio
-async def test_ttl_widen_is_applied():
-    # The safe direction still converges.
+async def test_stale_ttl_logs_live_and_configured_values_and_the_remedy(caplog):
+    """The signal is the whole point: the pre-BLA-1753 warning named neither the
+    values nor the fix, and prod sat at 30d while config said 365."""
+    import logging
+
     db = ConflictingDB(live_ttl_seconds=30 * 86400)
     writer = ObservabilityWriter(db, ttl_days=1825)
-    await writer.ensure_trace_indexes()
-    assert [c["collMod"] for c in db.commands] == [LLM_TRACES, TOOL_CALLS, AGENT_RUNS]
-    assert all(c["index"]["expireAfterSeconds"] == 1825 * 86400 for c in db.commands)
+    with caplog.at_level(logging.ERROR):
+        await writer.ensure_trace_indexes()
+
+    text = caplog.text
+    assert "live=30d" in text
+    assert "configured ttl_days=1825" in text
+    assert "collMod" in text and "expireAfterSeconds: 157680000" in text
+    for coll in (LLM_TRACES, TOOL_CALLS, AGENT_RUNS):
+        assert coll in text
 
 
 @pytest.mark.asyncio
-async def test_ttl_collmod_denied_never_raises_and_does_not_block_writes():
-    # No collMod privilege (the per-service app users may lack it): the write
-    # path must survive, and the failure is logged rather than raised.
-    db = ConflictingDB(collmod_fails="denied", live_ttl_seconds=30 * 86400)
+async def test_stale_ttl_is_terminal_and_does_not_block_or_repeat():
+    """Reporting latches: the existing index stays authoritative and no retry can
+    change that, so writes must not pay for a re-report on every batch."""
+    db = ConflictingDB(live_ttl_seconds=30 * 86400)
     writer = ObservabilityWriter(db, ttl_days=1825)
     await writer.ensure_trace_indexes()
-    assert len(db.commands) == 3
+    assert writer._indexes_ensured is True
 
+    before = len(db.calls)
     written = await writer.write_records(
         [llm_trace("run-1", model="m")], user_id="u1", client_email="u@b.com"
     )
-    assert written == 1
+    assert written == 1                      # writes are unaffected
+    assert len(db.calls) == before + 1       # exactly the insert, no index churn
 
 
 @pytest.mark.asyncio
-async def test_ttl_collmod_denied_is_terminal_and_not_retried_per_write():
-    # A privilege gap does not heal on its own. Retrying it on every write would
-    # spam the log and the DB, so it latches after the first attempt.
-    db = ConflictingDB(collmod_fails="denied", live_ttl_seconds=30 * 86400)
+async def test_stale_ttl_report_never_raises_on_malformed_index_metadata():
+    """_report_stale_ttl runs inside an `except` handler, where a raise would
+    escape ensure_trace_indexes' documented never-raise contract."""
+    class Malformed(ConflictingCollection):
+        async def index_information(self):
+            return {"bad": {"key": [1]}}     # int, not a (name, direction) tuple
+
+    class MalformedDB(ConflictingDB):
+        def __getitem__(self, name):
+            if name not in self._colls:
+                self._colls[name] = Malformed(name, self.calls)
+            return self._colls[name]
+
+    db = MalformedDB()
     writer = ObservabilityWriter(db, ttl_days=1825)
-    await writer.ensure_trace_indexes()
-    assert writer._indexes_ensured is True
-    assert len(db.commands) == 3
-
-    await writer.write_records([llm_trace("r")], user_id="u1", client_email="u@b.com")
-    assert len(db.commands) == 3  # no re-attempt
-
-
-@pytest.mark.asyncio
-async def test_ttl_collmod_transient_failure_does_not_latch_and_retries():
-    # A transient failure (outage / election / reset) MUST NOT latch: latching
-    # would leave the stale TTL authoritative for the whole process lifetime —
-    # exactly the silent-drift failure this change exists to remove.
-    db = ConflictingDB(collmod_fails="transient", live_ttl_seconds=30 * 86400)
-    writer = ObservabilityWriter(db, ttl_days=1825)
-    await writer.ensure_trace_indexes()
-    assert writer._indexes_ensured is False
-    assert len(db.commands) == 3
-
-    # next write retries convergence...
-    await writer.write_records([llm_trace("r")], user_id="u1", client_email="u@b.com")
-    assert len(db.commands) == 6
-    assert writer._indexes_ensured is False
-
-    # ...and once the store recovers it converges and latches.
-    db._collmod_fails = None
-    await writer.write_records([llm_trace("r")], user_id="u1", client_email="u@b.com")
-    assert len(db.commands) == 9
-    assert writer._indexes_ensured is True
+    await writer.ensure_trace_indexes()      # must not raise
+    assert db.commands == []
 
 
 def test_documentdb_kwargs_disables_retrywrites_with_tls():
