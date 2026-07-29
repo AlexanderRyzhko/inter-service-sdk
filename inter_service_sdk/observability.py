@@ -265,6 +265,11 @@ class ObservabilityWriter:
         self.max_records_per_batch = max_records_per_batch
         self.write_timeout_s = write_timeout_s
         self._indexes_ensured = False
+        # An index conflict whose live TTL cannot be read is retried on later
+        # writes (the store may recover), but bounded — an unbounded re-probe
+        # costs 2 extra round trips per collection on every write batch.
+        self._conflict_probe_attempts = 0
+        self._max_conflict_probes = 3
 
     @staticmethod
     def _require_pymongo():
@@ -326,11 +331,15 @@ class ObservabilityWriter:
             return "unreadable", None
         return "no_ttl", None
 
-    async def _report_index_conflict(self, coll: str, exc: Exception) -> bool:
+    async def _report_index_conflict(self, coll: str, exc: Exception) -> str:
         """Log an ACTIONABLE error for an ``IndexOptionsConflict`` (code 85).
 
-        Returns True if the configured TTL is **not** provably in effect, so the
-        caller can avoid claiming otherwise.
+        Returns the classification so the caller can summarize by REMEDY —
+        ``"stale_ttl"`` (collMod), ``"no_ttl"`` (drop + recreate),
+        ``"unreadable"`` (state unknown, nothing to prescribe) or ``"other"``
+        (TTL is fine, the conflict is on another option). Lumping these together
+        produced a summary promising a collMod for an index that needs
+        drop+recreate instead.
 
         Code 85 is a GENERIC index-options conflict, not a TTL-specific one — it
         also fires for a mismatch on name, ``partialFilterExpression``,
@@ -351,7 +360,7 @@ class ObservabilityWriter:
                 "db.%s.getIndexes().",
                 coll, live // 86400, self._ttl_seconds // 86400, exc, coll,
             )
-            return False
+            return "other"
 
         if status == "no_ttl":
             # A received_at index with no expireAfterSeconds never expires.
@@ -364,7 +373,7 @@ class ObservabilityWriter:
                 "with db.%s.getIndexes().",
                 coll, self._ttl_seconds // 86400, exc, coll,
             )
-            return True
+            return "no_ttl"
 
         if status == "unreadable":
             logger.error(
@@ -373,9 +382,10 @@ class ObservabilityWriter:
                 "with db.%s.getIndexes().",
                 coll, self._ttl_seconds // 86400, exc, coll,
             )
-            return True
+            return "unreadable"
 
-        return await self._report_stale_ttl(coll, live)
+        await self._report_stale_ttl(coll, live)
+        return "stale_ttl"
 
     async def _report_stale_ttl(self, coll: str, live: int) -> bool:
         """Log an ACTIONABLE error for a TTL index that doesn't match config.
@@ -424,18 +434,15 @@ class ObservabilityWriter:
         _, _, OperationFailure = self._require_pymongo()
 
         all_handled = True
-        stale: List[str] = []
+        by_remedy: Dict[str, List[str]] = {"stale_ttl": [], "no_ttl": [], "unreadable": []}
         for coll in (LLM_TRACES, TOOL_CALLS, AGENT_RUNS):
             try:
                 await self._db[coll].create_index("received_at", expireAfterSeconds=self._ttl_seconds)
             except OperationFailure as e:  # noqa: BLE001 — best-effort, never raise
                 if getattr(e, "code", None) == 85:  # IndexOptionsConflict
-                    # Terminal by design: the existing index stays authoritative
-                    # and no retry can change that, so latch and let the logged
-                    # command be the escalation. Re-reporting on every write
-                    # would spam the log and the DB for no gain.
-                    if await self._report_index_conflict(coll, e):
-                        stale.append(coll)
+                    outcome = await self._report_index_conflict(coll, e)
+                    if outcome in by_remedy:
+                        by_remedy[outcome].append(coll)
                 else:
                     all_handled = False
                     logger.warning("Failed to ensure TTL index on %s: %s", coll, e)
@@ -443,21 +450,48 @@ class ObservabilityWriter:
                 all_handled = False
                 logger.warning("Failed to ensure TTL index on %s: %s", coll, e)
 
-        # Only latch once every collection has an index or a permanent conflict;
-        # a transient failure leaves it False to retry on the next write.
+        # A conflict whose live state we COULD read is terminal — the existing
+        # index stays authoritative and no retry changes that, so latch and let
+        # the logged command be the escalation. An UNREADABLE live state is not
+        # terminal: the store may recover and we would then owe an accurate
+        # report. Retry it, but bounded — re-probing forever would put 2 extra
+        # round trips per collection on every write batch.
+        unreadable = by_remedy["unreadable"]
+        if unreadable:
+            self._conflict_probe_attempts += 1
+            if self._conflict_probe_attempts < self._max_conflict_probes:
+                all_handled = False
+
         if all_handled:
             self._indexes_ensured = True
-            if stale:
-                # Never claim "ensured (ttl=X)" while X is the value NOT in
-                # effect — a false all-clear at INFO is the same misleading
-                # signal this change exists to remove (BLA-1753).
+            # Never claim "ensured (ttl=X)" while X is the value NOT in effect —
+            # a false all-clear is the same misleading signal this change exists
+            # to remove (BLA-1753). Summarize BY REMEDY: collMod fixes a stale
+            # TTL, but a non-TTL index needs drop+recreate and an unknown state
+            # needs inspection, so one blanket "run collMod" line would be wrong
+            # for two of the three.
+            if by_remedy["stale_ttl"]:
                 logger.warning(
-                    "Observability TTL indexes checked: %d of 3 collection(s) still "
-                    "STALE and awaiting a manual collMod (%s); configured ttl_days=%s "
-                    "is NOT in effect for them.",
-                    len(stale), ", ".join(stale), self._ttl_seconds // 86400,
+                    "Observability: %d collection(s) have a STALE TTL awaiting a manual "
+                    "collMod (%s); configured ttl_days=%s is NOT in effect for them.",
+                    len(by_remedy["stale_ttl"]), ", ".join(by_remedy["stale_ttl"]),
+                    self._ttl_seconds // 86400,
                 )
-            else:
+            if by_remedy["no_ttl"]:
+                logger.warning(
+                    "Observability: %d collection(s) have a received_at index with NO "
+                    "TTL (%s); they need a DROP + RECREATE, not a collMod.",
+                    len(by_remedy["no_ttl"]), ", ".join(by_remedy["no_ttl"]),
+                )
+            if unreadable:
+                logger.warning(
+                    "Observability: %d collection(s) conflict with an unreadable live "
+                    "TTL (%s) after %d attempt(s); state unknown — inspect with "
+                    "getIndexes() before assuming any remedy.",
+                    len(unreadable), ", ".join(unreadable),
+                    self._conflict_probe_attempts,
+                )
+            if not any(by_remedy.values()):
                 logger.info("Observability TTL indexes ensured (ttl=%ss)", self._ttl_seconds)
 
     async def write_records(

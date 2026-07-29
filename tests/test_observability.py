@@ -572,6 +572,76 @@ async def test_unreadable_live_ttl_says_so_rather_than_asserting_the_index_exist
 
 
 @pytest.mark.asyncio
+async def test_summary_prescribes_collmod_only_for_a_confirmed_stale_ttl(caplog):
+    """The run summary must match the per-collection remedy.
+
+    collMod fixes a stale TTL; a non-TTL index needs drop+recreate and an
+    unknown state needs inspection. One blanket "run collMod" summary was wrong
+    for two of the three.
+    """
+    import logging
+
+    # non-TTL received_at index → drop + recreate, never collMod
+    db = ConflictingDB(live_ttl_seconds=None)
+    writer = ObservabilityWriter(db, ttl_days=1825)
+    with caplog.at_level(logging.WARNING):
+        await writer.ensure_trace_indexes()
+    text = caplog.text
+    assert "DROP + RECREATE" in text
+    assert "awaiting a manual collMod" not in text
+
+    caplog.clear()
+
+    # genuinely stale TTL → collMod is correct here
+    db2 = ConflictingDB(live_ttl_seconds=30 * 86400)
+    writer2 = ObservabilityWriter(db2, ttl_days=1825)
+    with caplog.at_level(logging.WARNING):
+        await writer2.ensure_trace_indexes()
+    assert "awaiting a manual collMod" in caplog.text
+    assert "DROP + RECREATE" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_unreadable_live_ttl_retries_then_reports_accurately_on_recovery(caplog):
+    """An unreadable live state is not terminal — the store may recover, and we
+    then owe an accurate stale-vs-fine report instead of a permanent unknown."""
+    import logging
+
+    db = ConflictingDB(live_ttl_seconds=30 * 86400, index_info_raises=True)
+    writer = ObservabilityWriter(db, ttl_days=1825)
+    await writer.ensure_trace_indexes()
+    assert writer._indexes_ensured is False        # did NOT latch on unknown
+
+    # store recovers; the next write re-probes and reports the real mismatch
+    for coll in db._colls.values():
+        coll.index_info_raises = False
+    caplog.clear()
+    with caplog.at_level(logging.ERROR):
+        await writer.write_records(
+            [llm_trace("r")], user_id="u1", client_email="u@b.com"
+        )
+    assert "TTL index is STALE: live=30d, configured ttl_days=1825" in caplog.text
+    assert writer._indexes_ensured is True
+    assert db.commands == []
+
+
+@pytest.mark.asyncio
+async def test_unreadable_live_ttl_retry_is_bounded():
+    """Retrying forever would add 2 round trips per collection to every write."""
+    db = ConflictingDB(live_ttl_seconds=30 * 86400, index_info_raises=True)
+    writer = ObservabilityWriter(db, ttl_days=1825)
+
+    for _ in range(writer._max_conflict_probes + 3):
+        await writer.write_records(
+            [llm_trace("r")], user_id="u1", client_email="u@b.com"
+        )
+    assert writer._indexes_ensured is True                       # gave up
+    assert writer._conflict_probe_attempts == writer._max_conflict_probes
+    # 3 collections x 2 ops (create_index + index_information) x 3 attempts
+    assert len(db.index_ops) == 3 * 2 * writer._max_conflict_probes
+
+
+@pytest.mark.asyncio
 async def test_stale_ttl_is_terminal_and_does_not_block_or_repeat():
     """Reporting latches: the existing index stays authoritative and no retry can
     change that, so writes must not pay for a re-report on every batch."""
