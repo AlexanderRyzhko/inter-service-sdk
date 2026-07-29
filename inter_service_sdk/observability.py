@@ -32,7 +32,7 @@ import asyncio
 import logging
 import threading
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -299,9 +299,18 @@ class ObservabilityWriter:
         doc["received_at"] = datetime.now(timezone.utc)
         return doc
 
-    async def _live_ttl_seconds(self, coll: str) -> Optional[int]:
-        """``expireAfterSeconds`` of the live ``received_at`` TTL index, or None
-        if it can't be read (no index, or the query failed)."""
+    async def _live_ttl_seconds(self, coll: str) -> Tuple[str, Optional[int]]:
+        """Inspect the live ``received_at`` index.
+
+        Returns ``(status, expire_after_seconds)`` where status is:
+          * ``"ok"``         — a TTL index was found; the value is its TTL
+          * ``"no_ttl"``     — a ``received_at`` index exists but carries no
+            ``expireAfterSeconds`` (i.e. never expires), or none was found
+          * ``"unreadable"`` — the metadata query failed
+
+        ``no_ttl`` and ``unreadable`` are distinguished so the operator-facing
+        message doesn't assert an index exists when we could not look.
+        """
         # The spec walk stays INSIDE the try. This runs from inside
         # ensure_trace_indexes' ``except OperationFailure`` handler, and Python
         # does not re-dispatch to a sibling ``except`` of the same try — so
@@ -311,10 +320,11 @@ class ObservabilityWriter:
             for spec in (info or {}).values():
                 keys = spec.get("key") if isinstance(spec, dict) else None
                 if keys and list(keys)[0][0] == "received_at" and "expireAfterSeconds" in spec:
-                    return int(spec["expireAfterSeconds"])
+                    return "ok", int(spec["expireAfterSeconds"])
         except Exception as e:  # noqa: BLE001 — best-effort, never raise
             logger.warning("Could not read index info for %s: %s", coll, e)
-        return None
+            return "unreadable", None
+        return "no_ttl", None
 
     async def _report_index_conflict(self, coll: str, exc: Exception) -> bool:
         """Log an ACTIONABLE error for an ``IndexOptionsConflict`` (code 85).
@@ -329,9 +339,9 @@ class ObservabilityWriter:
         conflict, and claimed a mismatch even when the live TTL already equalled
         the configured one. Read the live value and branch on it.
         """
-        live = await self._live_ttl_seconds(coll)
+        status, live = await self._live_ttl_seconds(coll)
 
-        if live is not None and live == self._ttl_seconds:
+        if status == "ok" and live == self._ttl_seconds:
             # TTL matches; the conflict is on some OTHER index option. A collMod
             # of expireAfterSeconds would be a no-op, so don't suggest it.
             logger.error(
@@ -343,15 +353,24 @@ class ObservabilityWriter:
             )
             return False
 
-        if live is None:
-            # Either unreadable, or a received_at index carrying no
-            # expireAfterSeconds at all (i.e. never expires). collMod cannot add
-            # a TTL to a non-TTL index — that needs drop + recreate.
+        if status == "no_ttl":
+            # A received_at index with no expireAfterSeconds never expires.
+            # collMod cannot add a TTL to a non-TTL index — that needs
+            # drop + recreate.
             logger.error(
-                "%s received_at index exists but its TTL could not be confirmed, so "
-                "configured ttl_days=%s is NOT known to be in effect: %s. Inspect "
-                "with db.%s.getIndexes(); if the index carries no expireAfterSeconds "
-                "it must be dropped and recreated, not collMod'd.",
+                "%s has a received_at index with NO expireAfterSeconds (it never "
+                "expires), so configured ttl_days=%s is not in effect: %s. It must be "
+                "dropped and recreated with the TTL — collMod cannot add one. Inspect "
+                "with db.%s.getIndexes().",
+                coll, self._ttl_seconds // 86400, exc, coll,
+            )
+            return True
+
+        if status == "unreadable":
+            logger.error(
+                "%s index options conflict and the live TTL could NOT be read, so "
+                "configured ttl_days=%s is not known to be in effect: %s. Inspect "
+                "with db.%s.getIndexes().",
                 coll, self._ttl_seconds // 86400, exc, coll,
             )
             return True
@@ -395,9 +414,10 @@ class ObservabilityWriter:
         index-creation failure must not break the write path (docs simply won't
         auto-expire until the index lands).
 
-        An index that already exists with a DIFFERENT TTL is reported, not
-        rewritten: see :meth:`_report_stale_ttl` for why mutating a shared TTL
-        index is an operator action rather than a library one.
+        An index that already conflicts is reported, not rewritten: see
+        :meth:`_report_index_conflict` for the classification, and
+        :meth:`_report_stale_ttl` for why mutating a shared TTL index is an
+        operator action rather than a library one.
         """
         if self._indexes_ensured:
             return

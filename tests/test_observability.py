@@ -547,8 +547,26 @@ async def test_unconfirmable_ttl_does_not_claim_ensured(caplog):
         await writer.ensure_trace_indexes()
 
     text = caplog.text
-    assert "NOT known to be in effect" in text
+    assert "NO expireAfterSeconds" in text
     assert "dropped and recreated" in text
+    assert "TTL indexes ensured" not in text
+    assert db.commands == []
+
+
+@pytest.mark.asyncio
+async def test_unreadable_live_ttl_says_so_rather_than_asserting_the_index_exists(caplog):
+    """An unreadable metadata query and a present-but-non-TTL index are different
+    facts; the message must not claim the latter when it only observed the former."""
+    import logging
+
+    db = ConflictingDB(live_ttl_seconds=30 * 86400, index_info_raises=True)
+    writer = ObservabilityWriter(db, ttl_days=1825)
+    with caplog.at_level(logging.INFO):
+        await writer.ensure_trace_indexes()
+
+    text = caplog.text
+    assert "could NOT be read" in text
+    assert "NO expireAfterSeconds" not in text     # don't claim what wasn't seen
     assert "TTL indexes ensured" not in text
     assert db.commands == []
 
