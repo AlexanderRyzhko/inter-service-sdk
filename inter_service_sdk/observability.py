@@ -361,6 +361,7 @@ class ObservabilityWriter:
         _, _, OperationFailure = self._require_pymongo()
 
         all_handled = True
+        stale: List[str] = []
         for coll in (LLM_TRACES, TOOL_CALLS, AGENT_RUNS):
             try:
                 await self._db[coll].create_index("received_at", expireAfterSeconds=self._ttl_seconds)
@@ -371,6 +372,7 @@ class ObservabilityWriter:
                     # command be the escalation. Re-reporting on every write
                     # would spam the log and the DB for no gain.
                     await self._report_stale_ttl(coll)
+                    stale.append(coll)
                 else:
                     all_handled = False
                     logger.warning("Failed to ensure TTL index on %s: %s", coll, e)
@@ -382,7 +384,18 @@ class ObservabilityWriter:
         # a transient failure leaves it False to retry on the next write.
         if all_handled:
             self._indexes_ensured = True
-            logger.info("Observability TTL indexes ensured (ttl=%ss)", self._ttl_seconds)
+            if stale:
+                # Never claim "ensured (ttl=X)" while X is the value NOT in
+                # effect — a false all-clear at INFO is the same misleading
+                # signal this change exists to remove (BLA-1753).
+                logger.warning(
+                    "Observability TTL indexes checked: %d of 3 collection(s) still "
+                    "STALE and awaiting a manual collMod (%s); configured ttl_days=%s "
+                    "is NOT in effect for them.",
+                    len(stale), ", ".join(stale), self._ttl_seconds // 86400,
+                )
+            else:
+                logger.info("Observability TTL indexes ensured (ttl=%ss)", self._ttl_seconds)
 
     async def write_records(
         self,

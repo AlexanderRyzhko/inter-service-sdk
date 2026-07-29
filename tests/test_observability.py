@@ -406,13 +406,22 @@ class ConflictingCollection(FakeCollection):
 
     live_ttl_seconds = None
     index_info_raises = False
+    index_ops = None  # shared list, set by ConflictingDB
 
     async def create_index(self, *args, **kwargs):
         from pymongo.errors import OperationFailure
 
+        # Recorded BEFORE raising: FakeDB.calls deliberately excludes index
+        # operations, so without this a "no index churn" assertion would be
+        # vacuous — re-running ensure_trace_indexes() every batch would leave
+        # the write count untouched and the test would still pass.
+        if self.index_ops is not None:
+            self.index_ops.append(("create_index", self.name))
         raise OperationFailure("index already exists with different options", 85)
 
     async def index_information(self):
+        if self.index_ops is not None:
+            self.index_ops.append(("index_information", self.name))
         if self.index_info_raises:
             raise RuntimeError("connection reset while reading index metadata")
         if self.live_ttl_seconds is None:
@@ -438,6 +447,7 @@ class ConflictingDB(FakeDB):
     def __init__(self, *, live_ttl_seconds=None, index_info_raises=False):
         super().__init__()
         self.commands = []
+        self.index_ops = []
         self._live_ttl_seconds = live_ttl_seconds
         self._index_info_raises = index_info_raises
 
@@ -446,6 +456,7 @@ class ConflictingDB(FakeDB):
             coll = ConflictingCollection(name, self.calls)
             coll.live_ttl_seconds = self._live_ttl_seconds
             coll.index_info_raises = self._index_info_raises
+            coll.index_ops = self.index_ops
             self._colls[name] = coll
         return self._colls[name]
 
@@ -505,12 +516,17 @@ async def test_stale_ttl_is_terminal_and_does_not_block_or_repeat():
     await writer.ensure_trace_indexes()
     assert writer._indexes_ensured is True
 
-    before = len(db.calls)
+    index_ops_after_first_pass = len(db.index_ops)
+    assert index_ops_after_first_pass > 0    # it really did probe on pass 1
+
     written = await writer.write_records(
         [llm_trace("run-1", model="m")], user_id="u1", client_email="u@b.com"
     )
     assert written == 1                      # writes are unaffected
-    assert len(db.calls) == before + 1       # exactly the insert, no index churn
+    # No index churn: the write path must not re-probe or re-report per batch.
+    # db.index_ops (not db.calls) is what can see this — FakeDB.calls excludes
+    # index operations by design.
+    assert len(db.index_ops) == index_ops_after_first_pass
 
 
 @pytest.mark.asyncio
