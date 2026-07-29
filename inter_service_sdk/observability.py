@@ -371,11 +371,13 @@ class ObservabilityWriter:
         make. Applying a TTL change is an operator action, run once per
         environment with an admin role.
 
-        What this fixes relative to the pre-BLA-1753 behaviour is the *signal*:
-        the old warning ("index already exists with different options") named
-        neither value nor remedy, and prod consequently sat at 30d for the whole
-        life of ``OBSERVABILITY_TRACE_TTL_DAYS=365``. This names live vs
-        configured and the exact command, so it is greppable and alertable.
+        What this fixes relative to the pre-BLA-1753 behaviour is the *signal*.
+        The old log named the remedy generically ("changing the TTL requires a
+        manual index drop or collMod") but at WARNING, and it named neither the
+        live value, the configured value, nor the command to run — and prod
+        consequently sat at 30d for the whole life of
+        ``OBSERVABILITY_TRACE_TTL_DAYS=365``. This logs at ERROR with both
+        numbers and the exact command, so it is greppable and alertable.
         """
         logger.error(
             "%s TTL index is STALE: live=%sd, configured ttl_days=%s. Retention will "

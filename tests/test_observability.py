@@ -491,8 +491,9 @@ async def test_stale_ttl_is_never_mutated_by_the_writer(live_ttl_seconds, index_
 
 @pytest.mark.asyncio
 async def test_stale_ttl_logs_live_and_configured_values_and_the_remedy(caplog):
-    """The signal is the whole point: the pre-BLA-1753 warning named neither the
-    values nor the fix, and prod sat at 30d while config said 365."""
+    """The signal is the whole point: the pre-BLA-1753 log named the remedy only
+    generically, at WARNING, with neither the live nor the configured value — and
+    prod sat at 30d while config said 365."""
     import logging
 
     db = ConflictingDB(live_ttl_seconds=30 * 86400)
