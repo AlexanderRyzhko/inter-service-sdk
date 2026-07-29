@@ -467,8 +467,9 @@ class ConflictingDB(FakeDB):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("live_ttl_seconds, index_info_raises", [
-    (30 * 86400, False),      # live shorter than configured (a "widen")
-    (1825 * 86400, False),    # live longer than configured (a "shrink")
+    (30 * 86400, False),      # live SHORTER than configured 1825d (a "widen")
+    (3650 * 86400, False),    # live LONGER than configured 1825d (a "shrink")
+    (1825 * 86400, False),    # live EQUAL to configured — conflict is elsewhere
     (None, False),            # received_at index with no expireAfterSeconds
     (30 * 86400, True),       # live value unreadable
 ])
@@ -505,6 +506,50 @@ async def test_stale_ttl_logs_live_and_configured_values_and_the_remedy(caplog):
     assert "collMod" in text and "expireAfterSeconds: 157680000" in text
     for coll in (LLM_TRACES, TOOL_CALLS, AGENT_RUNS):
         assert coll in text
+
+
+@pytest.mark.asyncio
+async def test_code_85_with_matching_ttl_is_not_reported_as_stale(caplog):
+    """Code 85 is a GENERIC IndexOptionsConflict, not a TTL-specific one.
+
+    It also fires for a mismatch on name / partialFilterExpression / unique. When
+    the live TTL already equals the configured one, calling it a stale TTL and
+    suggesting `collMod expireAfterSeconds` names a remedy that would be a no-op
+    and a mismatch that does not exist.
+    """
+    import logging
+
+    db = ConflictingDB(live_ttl_seconds=1825 * 86400)
+    writer = ObservabilityWriter(db, ttl_days=1825)
+    with caplog.at_level(logging.INFO):
+        await writer.ensure_trace_indexes()
+
+    text = caplog.text
+    assert "STALE" not in text
+    assert "collMod" not in text                      # no misleading remedy
+    assert "option other than the TTL" in text
+    # TTL *is* in effect, so the all-clear is accurate here.
+    assert "TTL indexes ensured" in text
+    assert db.commands == []
+
+
+@pytest.mark.asyncio
+async def test_unconfirmable_ttl_does_not_claim_ensured(caplog):
+    """A received_at index with no expireAfterSeconds (never expires) or an
+    unreadable one must not be reported as 'ensured' — and collMod cannot add a
+    TTL to a non-TTL index, so the remedy differs."""
+    import logging
+
+    db = ConflictingDB(live_ttl_seconds=None)
+    writer = ObservabilityWriter(db, ttl_days=1825)
+    with caplog.at_level(logging.INFO):
+        await writer.ensure_trace_indexes()
+
+    text = caplog.text
+    assert "NOT known to be in effect" in text
+    assert "dropped and recreated" in text
+    assert "TTL indexes ensured" not in text
+    assert db.commands == []
 
 
 @pytest.mark.asyncio

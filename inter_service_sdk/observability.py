@@ -316,7 +316,49 @@ class ObservabilityWriter:
             logger.warning("Could not read index info for %s: %s", coll, e)
         return None
 
-    async def _report_stale_ttl(self, coll: str) -> None:
+    async def _report_index_conflict(self, coll: str, exc: Exception) -> bool:
+        """Log an ACTIONABLE error for an ``IndexOptionsConflict`` (code 85).
+
+        Returns True if the configured TTL is **not** provably in effect, so the
+        caller can avoid claiming otherwise.
+
+        Code 85 is a GENERIC index-options conflict, not a TTL-specific one — it
+        also fires for a mismatch on name, ``partialFilterExpression``,
+        ``unique``, and so on. Classifying every code 85 as a stale TTL emitted a
+        ``collMod expireAfterSeconds`` remedy that would not fix the actual
+        conflict, and claimed a mismatch even when the live TTL already equalled
+        the configured one. Read the live value and branch on it.
+        """
+        live = await self._live_ttl_seconds(coll)
+
+        if live is not None and live == self._ttl_seconds:
+            # TTL matches; the conflict is on some OTHER index option. A collMod
+            # of expireAfterSeconds would be a no-op, so don't suggest it.
+            logger.error(
+                "%s received_at index conflicts on an option other than the TTL "
+                "(live TTL is %sd, matching the configured ttl_days=%s): %s. The "
+                "existing index stays authoritative — inspect it with "
+                "db.%s.getIndexes().",
+                coll, live // 86400, self._ttl_seconds // 86400, exc, coll,
+            )
+            return False
+
+        if live is None:
+            # Either unreadable, or a received_at index carrying no
+            # expireAfterSeconds at all (i.e. never expires). collMod cannot add
+            # a TTL to a non-TTL index — that needs drop + recreate.
+            logger.error(
+                "%s received_at index exists but its TTL could not be confirmed, so "
+                "configured ttl_days=%s is NOT known to be in effect: %s. Inspect "
+                "with db.%s.getIndexes(); if the index carries no expireAfterSeconds "
+                "it must be dropped and recreated, not collMod'd.",
+                coll, self._ttl_seconds // 86400, exc, coll,
+            )
+            return True
+
+        return await self._report_stale_ttl(coll, live)
+
+    async def _report_stale_ttl(self, coll: str, live: int) -> bool:
         """Log an ACTIONABLE error for a TTL index that doesn't match config.
 
         Deliberately read-only. ``create_index`` cannot mutate
@@ -335,15 +377,14 @@ class ObservabilityWriter:
         life of ``OBSERVABILITY_TRACE_TTL_DAYS=365``. This names live vs
         configured and the exact command, so it is greppable and alertable.
         """
-        live = await self._live_ttl_seconds(coll)
-        live_desc = f"{live // 86400}d" if live is not None else "unknown"
         logger.error(
-            "%s TTL index is STALE: live=%s, configured ttl_days=%s. Retention will "
+            "%s TTL index is STALE: live=%sd, configured ttl_days=%s. Retention will "
             "NOT change until an operator applies it (this library never mutates a "
             "shared TTL index). Run: db.runCommand({collMod: \"%s\", index: "
             "{keyPattern: {received_at: 1}, expireAfterSeconds: %s}})",
-            coll, live_desc, self._ttl_seconds // 86400, coll, self._ttl_seconds,
+            coll, live // 86400, self._ttl_seconds // 86400, coll, self._ttl_seconds,
         )
+        return True
 
     async def ensure_trace_indexes(self) -> None:
         """Create TTL indexes on the three trace collections (idempotent, best-effort).
@@ -371,8 +412,8 @@ class ObservabilityWriter:
                     # and no retry can change that, so latch and let the logged
                     # command be the escalation. Re-reporting on every write
                     # would spam the log and the DB for no gain.
-                    await self._report_stale_ttl(coll)
-                    stale.append(coll)
+                    if await self._report_index_conflict(coll, e):
+                        stale.append(coll)
                 else:
                     all_handled = False
                     logger.warning("Failed to ensure TTL index on %s: %s", coll, e)
