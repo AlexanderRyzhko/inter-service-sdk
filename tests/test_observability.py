@@ -398,6 +398,66 @@ def test_submit_explicit_identity_overrides_default():
     _close_sync(sub)
 
 
+# --- TTL index convergence (BLA-1753) --------------------------------------
+
+class ConflictingCollection(FakeCollection):
+    """create_index always reports the index exists with a different TTL."""
+
+    async def create_index(self, *args, **kwargs):
+        from pymongo.errors import OperationFailure
+
+        raise OperationFailure("index already exists with different options", 85)
+
+
+class ConflictingDB(FakeDB):
+    """FakeDB whose collections conflict on create_index; records ``command``."""
+
+    def __init__(self, *, collmod_raises=False):
+        super().__init__()
+        self.commands = []
+        self._collmod_raises = collmod_raises
+
+    def __getitem__(self, name):
+        if name not in self._colls:
+            self._colls[name] = ConflictingCollection(name, self.calls)
+        return self._colls[name]
+
+    async def command(self, spec):
+        self.commands.append(spec)
+        if self._collmod_raises:
+            raise RuntimeError("not authorized on post_scaffolds to execute collMod")
+        return {"ok": 1}
+
+
+@pytest.mark.asyncio
+async def test_ttl_conflict_converges_existing_index_via_collmod():
+    # A pre-existing index with a different TTL must be MUTATED, not left stale —
+    # create_index can never change expireAfterSeconds (BLA-1753 drift bug).
+    db = ConflictingDB()
+    writer = ObservabilityWriter(db, ttl_days=1825)
+    await writer.ensure_trace_indexes()
+
+    assert [c["collMod"] for c in db.commands] == [LLM_TRACES, TOOL_CALLS, AGENT_RUNS]
+    for cmd in db.commands:
+        assert cmd["index"]["keyPattern"] == {"received_at": 1}
+        assert cmd["index"]["expireAfterSeconds"] == 1825 * 86400
+
+
+@pytest.mark.asyncio
+async def test_ttl_collmod_failure_never_raises_and_does_not_block_writes():
+    # No collMod privilege (the per-service app users may lack it): the write
+    # path must survive, and the failure is logged rather than raised.
+    db = ConflictingDB(collmod_raises=True)
+    writer = ObservabilityWriter(db, ttl_days=1825)
+    await writer.ensure_trace_indexes()
+    assert len(db.commands) == 3
+
+    written = await writer.write_records(
+        [llm_trace("run-1", model="m")], user_id="u1", client_email="u@b.com"
+    )
+    assert written == 1
+
+
 def test_documentdb_kwargs_disables_retrywrites_with_tls():
     # DocumentDB: TLS CA present → retryWrites disabled (DocumentDB rejects it).
     kw = _documentdb_client_kwargs("mongodb://host:27017", "/etc/ca.pem")

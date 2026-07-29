@@ -61,8 +61,10 @@ DEFAULT_MAX_RECORDS_PER_BATCH = 1000
 # driver's default (~30s) and piling up under a sustained outage.
 DEFAULT_WRITE_TIMEOUT_S = 5
 
-# Traces are ephemeral triage/debug data.
-DEFAULT_TTL_DAYS = 30
+# Traces are long-lived audit/analysis data (BLA-1753): 5 years. Services
+# override per-env from the shared ``OBSERVABILITY_TRACE_TTL_DAYS`` secret key;
+# this constant is only the fallback when nothing is configured.
+DEFAULT_TTL_DAYS = 1825
 
 
 class ObservabilityError(Exception):
@@ -297,12 +299,47 @@ class ObservabilityWriter:
         doc["received_at"] = datetime.now(timezone.utc)
         return doc
 
+    async def _collmod_ttl(self, coll: str) -> bool:
+        """Converge an existing TTL index to ``self._ttl_seconds`` via ``collMod``.
+
+        ``create_index`` cannot mutate ``expireAfterSeconds`` — it raises
+        ``IndexOptionsConflict`` (code 85). Only ``collMod`` can. Returns True if
+        the live index now matches the configured TTL.
+
+        Requires a role with ``collMod`` privilege; the per-service app users may
+        not have it. On failure this logs the exact command an operator must run,
+        because the silent alternative is what let prod sit at 30d while the
+        config said otherwise (BLA-1753).
+        """
+        try:
+            await self._db.command({
+                "collMod": coll,
+                "index": {
+                    "keyPattern": {"received_at": 1},
+                    "expireAfterSeconds": self._ttl_seconds,
+                },
+            })
+            logger.info("%s TTL index converged to %ss via collMod", coll, self._ttl_seconds)
+            return True
+        except Exception as e:  # noqa: BLE001 — best-effort, never raise
+            logger.error(
+                "%s TTL index is STALE and could not be converged automatically: %s. "
+                "Live retention does NOT match the configured ttl_days. Run manually: "
+                'db.runCommand({collMod: "%s", index: {keyPattern: {received_at: 1}, '
+                "expireAfterSeconds: %s}})",
+                coll, e, coll, self._ttl_seconds,
+            )
+            return False
+
     async def ensure_trace_indexes(self) -> None:
         """Create TTL indexes on the three trace collections (idempotent, best-effort).
 
         Runs lazily once per process on first write. Never raises — an
         index-creation failure must not break the write path (docs simply won't
         auto-expire until the index lands).
+
+        If an index already exists with a DIFFERENT TTL, this converges it with
+        ``collMod`` rather than leaving the stale index authoritative.
         """
         if self._indexes_ensured:
             return
@@ -314,14 +351,13 @@ class ObservabilityWriter:
                 await self._db[coll].create_index("received_at", expireAfterSeconds=self._ttl_seconds)
             except OperationFailure as e:  # noqa: BLE001 — best-effort, never raise
                 if getattr(e, "code", None) == 85:  # IndexOptionsConflict
-                    # Mutating a TTL needs a manual collMod/drop, not
-                    # create_index. Existing index stays authoritative — this
-                    # collection is "handled"; keep going.
-                    logger.warning(
-                        "%s TTL index already exists with a different TTL; changing the "
-                        "TTL requires a manual index drop or collMod. Keeping the "
-                        "existing index. (%s)", coll, e,
-                    )
+                    # The index exists with a different TTL. create_index can
+                    # never fix that — converge it explicitly. Either outcome is
+                    # terminal for this process (a privilege failure won't heal
+                    # on retry, and re-attempting per write would spam the log),
+                    # so the collection counts as "handled" either way; a failed
+                    # convergence is logged at ERROR with the manual command.
+                    await self._collmod_ttl(coll)
                 else:
                     all_handled = False
                     logger.warning("Failed to ensure TTL index on %s: %s", coll, e)
