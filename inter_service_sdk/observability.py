@@ -67,6 +67,11 @@ DEFAULT_WRITE_TIMEOUT_S = 5
 # this constant is only the fallback when nothing is configured.
 DEFAULT_TTL_DAYS = 1825
 
+# Minimum wall-clock gap between re-probes of an index whose live TTL could not
+# be read. Bounds the round-trip cost against a degraded store; the retry budget
+# then measures elapsed recovery time rather than caller volume.
+DEFAULT_PROBE_COOLDOWN_S = 30.0
+
 
 class ObservabilityError(Exception):
     """Base class for observability write-client errors."""
@@ -260,6 +265,7 @@ class ObservabilityWriter:
         ttl_days: int = DEFAULT_TTL_DAYS,
         max_records_per_batch: int = DEFAULT_MAX_RECORDS_PER_BATCH,
         write_timeout_s: float = DEFAULT_WRITE_TIMEOUT_S,
+        probe_cooldown_s: float = DEFAULT_PROBE_COOLDOWN_S,
     ) -> None:
         self._db = db
         self._ttl_seconds = int(ttl_days) * 24 * 60 * 60
@@ -293,7 +299,7 @@ class ObservabilityWriter:
         # first writes spent the whole retry budget immediately and latched on
         # "unknown". Re-probing is therefore also rate-limited in wall clock, so
         # the budget measures elapsed recovery time rather than caller volume.
-        self._probe_cooldown_s = 30.0
+        self._probe_cooldown_s = probe_cooldown_s
         self._last_probe_monotonic: Optional[float] = None
 
     @staticmethod
@@ -467,6 +473,13 @@ class ObservabilityWriter:
         # best-effort and the in-flight pass will finish it.
         if self._indexes_ensured or self._ensure_in_flight:
             return
+        # Every conflicting collection already has a verdict, and re-running
+        # create_index only re-raises code 85; nothing can change before the next
+        # probe is due. Rate-limit the WHOLE pass, not just the probe, so a
+        # degraded store (the only state that leaves us unlatched) is not charged
+        # 3 create_index round trips per write batch inside write_timeout_s.
+        if self._conflict_outcomes and not self._cooldown_elapsed():
+            return
         self._ensure_in_flight = True
         try:
             await self._ensure_trace_indexes_once()
@@ -494,11 +507,15 @@ class ObservabilityWriter:
                     # Classify once per collection. Only an "unreadable" verdict
                     # is worth re-probing (the store may recover), and only
                     # while attempts remain.
+                    # Classify once per collection. Only an "unreadable" verdict
+                    # is worth re-probing (the store may recover), while attempts
+                    # remain. The pass-level cooldown gate in the public entry
+                    # point already guarantees the window has elapsed, so no
+                    # second cooldown check is needed here.
                     cached = self._conflict_outcomes.get(coll)
                     retry_unknown = (
                         cached == "unreadable"
                         and self._conflict_probe_attempts < self._max_conflict_probes
-                        and self._cooldown_elapsed()
                     )
                     if cached is not None and not retry_unknown:
                         outcome = cached
@@ -506,6 +523,9 @@ class ObservabilityWriter:
                         outcome = await self._report_index_conflict(coll, e)
                         self._conflict_outcomes[coll] = outcome
                         probed = True
+                        # Stamp the window on the probe itself — the event this
+                        # timestamp names — rather than behind a separate guard.
+                        self._last_probe_monotonic = time.monotonic()
                     if outcome in by_remedy:
                         by_remedy[outcome].append(coll)
                 else:
@@ -519,11 +539,7 @@ class ObservabilityWriter:
         # index stays authoritative and no retry changes that, so latch and let
         # the logged command be the escalation. An UNREADABLE live state is not
         # terminal: the store may recover and we would then owe an accurate
-        # report. Retry it, but bounded — re-probing forever would put 2 extra
-        # round trips per collection on every write batch.
-        if probed:
-            self._last_probe_monotonic = time.monotonic()
-
+        # report. Retry it, but bounded, and rate-limited by the caller's gate.
         unreadable = by_remedy["unreadable"]
         if unreadable:
             # Count an ATTEMPT only when this pass actually probed. A pass that
@@ -534,6 +550,16 @@ class ObservabilityWriter:
                 self._conflict_probe_attempts += 1
             if self._conflict_probe_attempts < self._max_conflict_probes:
                 all_handled = False
+            elif probed:
+                # Budget exhausted on the pass that spent the last attempt: we
+                # are about to latch and go silent, so announce the transition
+                # from "still retrying" to "permanently unknown" explicitly.
+                logger.error(
+                    "Observability: retry budget exhausted after %d attempts; the "
+                    "live TTL for %s is now permanently UNKNOWN for this process — "
+                    "inspect with getIndexes().",
+                    self._conflict_probe_attempts, ", ".join(unreadable),
+                )
 
         if all_handled:
             self._indexes_ensured = True
@@ -548,8 +574,17 @@ class ObservabilityWriter:
         #     that new remedy must be reported rather than suppressed by the
         #     earlier unknown-state rollup.
         # Keying on the signature also stops an unchanged state from re-logging.
+        # Fold the attempt count into the "unreadable" bucket only, so the rollup
+        # re-emits as the count climbs (2, 3) instead of freezing at 1 — a
+        # readable-state remedy never changes across passes, but an unreadable
+        # one's whole story is "we are still trying, now on attempt N".
         signature = tuple(
-            (remedy, tuple(colls)) for remedy, colls in sorted(by_remedy.items()) if colls
+            (
+                remedy,
+                tuple(colls),
+                self._conflict_probe_attempts if remedy == "unreadable" else None,
+            )
+            for remedy, colls in sorted(by_remedy.items()) if colls
         )
         if signature and signature != self._conflict_summary_signature:
             self._conflict_summary_signature = signature
