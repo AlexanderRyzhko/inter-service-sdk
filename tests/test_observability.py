@@ -626,6 +626,49 @@ async def test_unreadable_live_ttl_retries_then_reports_accurately_on_recovery(c
 
 
 @pytest.mark.asyncio
+async def test_recovery_from_unreadable_emits_the_real_remedy_summary(caplog):
+    """A one-shot summary flag suppressed the by-remedy rollup forever once an
+    'unreadable' rollup had been emitted — so after the store recovered and the
+    collections reclassified as genuinely stale, the operator never saw the
+    collMod remedy. Suppression is keyed on the conflict state, not a bool."""
+    import logging
+
+    db = ConflictingDB(live_ttl_seconds=30 * 86400, index_info_raises=True)
+    writer = ObservabilityWriter(db, ttl_days=1825)
+    with caplog.at_level(logging.WARNING):
+        await writer.ensure_trace_indexes()
+    assert "state unknown" in caplog.text
+    assert "awaiting a manual collMod" not in caplog.text
+
+    # store recovers → the same collections reclassify as genuinely stale
+    for coll in db._colls.values():
+        coll.index_info_raises = False
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        await writer.write_records(
+            [llm_trace("r")], user_id="u1", client_email="u@b.com"
+        )
+    assert "awaiting a manual collMod" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_unchanged_conflict_state_does_not_re_log_the_summary(caplog):
+    """Keying on the signature must not turn into per-batch summary spam."""
+    import logging
+
+    db = ConflictingDB(live_ttl_seconds=30 * 86400)
+    writer = ObservabilityWriter(db, ttl_days=1825)
+    await writer.ensure_trace_indexes()
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        for _ in range(3):
+            await writer.write_records(
+                [llm_trace("r")], user_id="u1", client_email="u@b.com"
+            )
+    assert "awaiting a manual collMod" not in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_unreadable_live_ttl_retry_is_bounded():
     """Retrying forever would add 2 round trips per collection to every write."""
     db = ConflictingDB(live_ttl_seconds=30 * 86400, index_info_raises=True)

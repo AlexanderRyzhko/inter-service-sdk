@@ -275,7 +275,11 @@ class ObservabilityWriter:
         # because a SIBLING collection failed for an unrelated reason (e.g. a
         # code-13 Unauthorized) and kept the latch open.
         self._conflict_outcomes: Dict[str, str] = {}
-        self._conflict_summary_logged = False
+        # Signature of the last rollup emitted, NOT a bool. A process-global
+        # "already logged" flag meant an initial "unreadable" summary suppressed
+        # the real by-remedy rollup forever once the store recovered and the same
+        # collections reclassified as genuinely stale.
+        self._conflict_summary_signature: Optional[tuple] = None
 
     @staticmethod
     def _require_pymongo():
@@ -492,12 +496,19 @@ class ObservabilityWriter:
             if not any(by_remedy.values()):
                 logger.info("Observability TTL indexes ensured (ttl=%ss)", self._ttl_seconds)
 
-        # The rollup is emitted once, whether or not the latch was set. A sibling
-        # failure (e.g. code 13 on one collection) keeps all_handled False, and
-        # that is precisely the state where an operator most needs the summary —
-        # gating it on the latch meant it never appeared there.
-        if not self._conflict_summary_logged and any(by_remedy.values()):
-            self._conflict_summary_logged = True
+        # The rollup is emitted whenever the CONFLICT STATE changes, whether or
+        # not the latch was set. Two reasons it is not a one-shot flag:
+        #   * a sibling failure (e.g. code 13) keeps all_handled False, and that
+        #     is precisely where an operator most needs the summary;
+        #   * an "unreadable" state can later reclassify to a real stale TTL, and
+        #     that new remedy must be reported rather than suppressed by the
+        #     earlier unknown-state rollup.
+        # Keying on the signature also stops an unchanged state from re-logging.
+        signature = tuple(
+            (remedy, tuple(colls)) for remedy, colls in sorted(by_remedy.items()) if colls
+        )
+        if signature and signature != self._conflict_summary_signature:
+            self._conflict_summary_signature = signature
             # Never claim "ensured (ttl=X)" while X is the value NOT in effect —
             # a false all-clear is the same misleading signal this change exists
             # to remove (BLA-1753). Summarize BY REMEDY: collMod fixes a stale
