@@ -566,7 +566,7 @@ async def test_unreadable_live_ttl_says_so_rather_than_asserting_the_index_exist
     import logging
 
     db = ConflictingDB(live_ttl_seconds=30 * 86400, index_info_raises=True)
-    writer = ObservabilityWriter(db, ttl_days=1825, probe_cooldown_s=0)
+    writer = ObservabilityWriter(db, ttl_days=1825)
     with caplog.at_level(logging.INFO):
         await writer.ensure_trace_indexes()
 
@@ -608,53 +608,35 @@ async def test_summary_prescribes_collmod_only_for_a_confirmed_stale_ttl(caplog)
 
 
 @pytest.mark.asyncio
-async def test_unreadable_live_ttl_retries_then_reports_accurately_on_recovery(caplog):
-    """An unreadable live state is not terminal — the store may recover, and we
-    then owe an accurate stale-vs-fine report instead of a permanent unknown."""
+async def test_unreadable_conflict_is_terminal_reported_once_and_not_retried(caplog):
+    """An index-options conflict whose live TTL cannot be read is TERMINAL, like
+    any other code-85 verdict: reported once and latched. The SDK never mutates a
+    shared TTL index, so a conflict does not self-resolve and there is nothing to
+    gain by re-probing (BLA-1753 round 8 — dropping the retry machinery removed
+    the whole class of degraded-mode bookkeeping bugs). Even if the store later
+    becomes readable, the operator acts on the logged getIndexes() instruction."""
     import logging
 
     db = ConflictingDB(live_ttl_seconds=30 * 86400, index_info_raises=True)
-    writer = ObservabilityWriter(db, ttl_days=1825, probe_cooldown_s=0)
-    await writer.ensure_trace_indexes()
-    assert writer._indexes_ensured is False        # did NOT latch on unknown
-
-    # store recovers; the next write re-probes and reports the real mismatch
-    for coll in db._colls.values():
-        coll.index_info_raises = False
-    caplog.clear()
-    with caplog.at_level(logging.ERROR):
-        await writer.write_records(
-            [llm_trace("r")], user_id="u1", client_email="u@b.com"
-        )
-    assert "TTL index is STALE: live=2592000s (~30d), configured ttl_days=1825" in caplog.text
-    assert writer._indexes_ensured is True
-    assert db.commands == []
-
-
-@pytest.mark.asyncio
-async def test_recovery_from_unreadable_emits_the_real_remedy_summary(caplog):
-    """A one-shot summary flag suppressed the by-remedy rollup forever once an
-    'unreadable' rollup had been emitted — so after the store recovered and the
-    collections reclassified as genuinely stale, the operator never saw the
-    collMod remedy. Suppression is keyed on the conflict state, not a bool."""
-    import logging
-
-    db = ConflictingDB(live_ttl_seconds=30 * 86400, index_info_raises=True)
-    writer = ObservabilityWriter(db, ttl_days=1825, probe_cooldown_s=0)
+    writer = ObservabilityWriter(db, ttl_days=1825)
     with caplog.at_level(logging.WARNING):
         await writer.ensure_trace_indexes()
+    assert writer._indexes_ensured is True             # latched, not retried
     assert "state unknown" in caplog.text
-    assert "awaiting a manual collMod" not in caplog.text
+    probes_first = len([op for op in db.index_ops if op[0] == "index_information"])
 
-    # store recovers → the same collections reclassify as genuinely stale
+    # store becomes readable; a subsequent write must NOT re-probe or re-report
     for coll in db._colls.values():
         coll.index_info_raises = False
     caplog.clear()
     with caplog.at_level(logging.WARNING):
-        await writer.write_records(
-            [llm_trace("r")], user_id="u1", client_email="u@b.com"
-        )
-    assert "awaiting a manual collMod" in caplog.text
+        for _ in range(5):
+            await writer.write_records(
+                [llm_trace("r")], user_id="u1", client_email="u@b.com"
+            )
+    assert len([op for op in db.index_ops if op[0] == "index_information"]) == probes_first
+    assert "TTL index is STALE" not in caplog.text
+    assert db.commands == []                            # never a collMod
 
 
 @pytest.mark.asyncio
@@ -685,7 +667,7 @@ async def test_unchanged_conflict_state_does_not_re_log_the_summary(caplog):
             return self._colls[name]
 
     db = MixedDB(live_ttl_seconds=30 * 86400)
-    writer = ObservabilityWriter(db, ttl_days=1825, probe_cooldown_s=0)
+    writer = ObservabilityWriter(db, ttl_days=1825)
     await writer.ensure_trace_indexes()
     assert writer._indexes_ensured is False          # code 13 keeps it unlatched
     caplog.clear()
@@ -695,41 +677,6 @@ async def test_unchanged_conflict_state_does_not_re_log_the_summary(caplog):
                 [llm_trace("r")], user_id="u1", client_email="u@b.com"
             )
     assert "awaiting a manual collMod" not in caplog.text
-
-
-@pytest.mark.asyncio
-async def test_concurrent_first_writes_do_not_multiply_probes_or_burn_the_retry_budget():
-    """The SDK advertises `asyncio.create_task` off the request path, so the
-    first writes routinely arrive as a burst. Without a single-flight guard they
-    all clear the latch check before their first await: probes multiply, the
-    per-pass attempt counter blows past its bound in one go, and the writer
-    latches on `unknown` — killing the bounded recovery path entirely.
-
-    Default cooldown on purpose: single-flight alone does not fix this, because
-    inside one gather each write still runs a full pass after the previous
-    finished. The wall-clock rate limit is what makes the budget measure elapsed
-    recovery time rather than caller volume.
-    """
-    db = ConflictingDB(live_ttl_seconds=30 * 86400, index_info_raises=True)
-    writer = ObservabilityWriter(db, ttl_days=1825)
-
-    await asyncio.gather(*[
-        writer.write_records([llm_trace("r")], user_id="u1", client_email="u@b.com")
-        for _ in range(5)
-    ])
-
-    probes = [op for op in db.index_ops if op[0] == "index_information"]
-    assert len(probes) == 3                       # one pass, not five
-    assert writer._conflict_probe_attempts == 1   # budget not burned
-    assert writer._indexes_ensured is False       # still retryable
-
-    # ...so recovery still works and the real remedy still surfaces once the
-    # rate limit allows the next probe.
-    for coll in db._colls.values():
-        coll.index_info_raises = False
-    writer._probe_cooldown_s = 0
-    await writer.write_records([llm_trace("r")], user_id="u1", client_email="u@b.com")
-    assert writer._conflict_outcomes[LLM_TRACES] == "stale_ttl"
 
 
 @pytest.mark.asyncio
@@ -762,63 +709,6 @@ async def test_single_flight_prevents_overlapping_passes_when_the_probe_awaits()
 
     probes = [op for op in db.index_ops if op[0] == "index_information"]
     assert len(probes) == 3          # exactly one pass, not one per coroutine
-
-
-@pytest.mark.asyncio
-async def test_within_cooldown_pass_does_not_reprobe_or_advance_the_window():
-    """The pass-level cooldown gate is what makes the retry budget a RECOVERY-time
-    budget rather than a per-write one, and what stops a degraded store being
-    charged 3 create_index round trips per batch. A second call inside the
-    cooldown must not run the pass at all — no probe, window unchanged."""
-    db = ConflictingDB(live_ttl_seconds=30 * 86400, index_info_raises=True)
-    writer = ObservabilityWriter(db, ttl_days=1825)
-    await writer.ensure_trace_indexes()          # probes; stamps the window
-    stamp = writer._last_probe_monotonic
-    assert stamp is not None
-    probes_after_first = len([op for op in db.index_ops if op[0] == "index_information"])
-    await writer.ensure_trace_indexes()          # within cooldown → early return
-    assert writer._last_probe_monotonic == stamp
-    assert len([op for op in db.index_ops if op[0] == "index_information"]) == probes_after_first
-
-
-@pytest.mark.asyncio
-async def test_exhausting_the_retry_budget_announces_the_give_up(caplog):
-    """When the budget runs out the writer latches and goes silent for the rest
-    of the process; that transition must be logged, not inferred from absence."""
-    import logging
-
-    db = ConflictingDB(live_ttl_seconds=30 * 86400, index_info_raises=True)
-    writer = ObservabilityWriter(db, ttl_days=1825, probe_cooldown_s=0)
-    with caplog.at_level(logging.WARNING):
-        for _ in range(writer._max_conflict_probes + 2):
-            await writer.write_records(
-                [llm_trace("r")], user_id="u1", client_email="u@b.com"
-            )
-    # The unreadable rollup must RE-EMIT as the attempt count climbs, not freeze
-    # at "after 1 attempt(s)" — the count is folded into the summary signature.
-    assert "after 1 attempt(s)" in caplog.text
-    assert "after 2 attempt(s)" in caplog.text
-    assert f"after {writer._max_conflict_probes} attempt(s)" in caplog.text
-    # ...and the give-up transition is announced, not left to inference.
-    assert "retry budget exhausted" in caplog.text
-    assert f"after {writer._max_conflict_probes} attempts" in caplog.text
-    assert writer._indexes_ensured is True
-
-
-@pytest.mark.asyncio
-async def test_unreadable_live_ttl_retry_is_bounded():
-    """Retrying forever would add 2 round trips per collection to every write."""
-    db = ConflictingDB(live_ttl_seconds=30 * 86400, index_info_raises=True)
-    writer = ObservabilityWriter(db, ttl_days=1825, probe_cooldown_s=0)
-
-    for _ in range(writer._max_conflict_probes + 3):
-        await writer.write_records(
-            [llm_trace("r")], user_id="u1", client_email="u@b.com"
-        )
-    assert writer._indexes_ensured is True                       # gave up
-    assert writer._conflict_probe_attempts == writer._max_conflict_probes
-    # 3 collections x 2 ops (create_index + index_information) x 3 attempts
-    assert len(db.index_ops) == 3 * 2 * writer._max_conflict_probes
 
 
 @pytest.mark.asyncio

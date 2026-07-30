@@ -31,7 +31,6 @@ the extra: ``pip install inter-service-sdk[observability]``. The builders and
 import asyncio
 import logging
 import threading
-import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 
@@ -66,11 +65,6 @@ DEFAULT_WRITE_TIMEOUT_S = 5
 # override per-env from the shared ``OBSERVABILITY_TRACE_TTL_DAYS`` secret key;
 # this constant is only the fallback when nothing is configured.
 DEFAULT_TTL_DAYS = 1825
-
-# Minimum wall-clock gap between re-probes of an index whose live TTL could not
-# be read. Bounds the round-trip cost against a degraded store; the retry budget
-# then measures elapsed recovery time rather than caller volume.
-DEFAULT_PROBE_COOLDOWN_S = 30.0
 
 
 class ObservabilityError(Exception):
@@ -265,42 +259,27 @@ class ObservabilityWriter:
         ttl_days: int = DEFAULT_TTL_DAYS,
         max_records_per_batch: int = DEFAULT_MAX_RECORDS_PER_BATCH,
         write_timeout_s: float = DEFAULT_WRITE_TIMEOUT_S,
-        probe_cooldown_s: float = DEFAULT_PROBE_COOLDOWN_S,
     ) -> None:
         self._db = db
         self._ttl_seconds = int(ttl_days) * 24 * 60 * 60
         self.max_records_per_batch = max_records_per_batch
         self.write_timeout_s = write_timeout_s
         self._indexes_ensured = False
-        # An index conflict whose live TTL cannot be read is retried on later
-        # writes (the store may recover), but bounded — an unbounded re-probe
-        # costs 2 extra round trips per collection on every write batch.
-        self._conflict_probe_attempts = 0
-        self._max_conflict_probes = 3
         # Per-collection classification cache. A code-85 conflict is terminal for
-        # that collection, so it must never be re-probed or re-reported just
-        # because a SIBLING collection failed for an unrelated reason (e.g. a
-        # code-13 Unauthorized) and kept the latch open.
+        # that collection, so it must never be re-reported just because a SIBLING
+        # collection failed for an unrelated reason (e.g. a code-13 Unauthorized)
+        # and kept the pass unlatched.
         self._conflict_outcomes: Dict[str, str] = {}
         # Signature of the last rollup emitted, NOT a bool. A process-global
-        # "already logged" flag meant an initial "unreadable" summary suppressed
-        # the real by-remedy rollup forever once the store recovered and the same
-        # collections reclassified as genuinely stale.
+        # "already logged" flag would suppress the by-remedy rollup after the set
+        # of conflicting collections changes; keying on the signature re-emits on
+        # change and stays quiet on a steady state.
         self._conflict_summary_signature: Optional[tuple] = None
-        # Single-flight guard. The attempt counter below assumes passes are
-        # spread over SUCCESSIVE write batches; without this, a burst of
-        # concurrent first writes (the advertised ``asyncio.create_task``
-        # pattern) all clear the latch check before their first await, so they
-        # probe in parallel and blow past the bound in one go. Set and checked
+        # Single-flight guard: a burst of concurrent first writes (the advertised
+        # ``asyncio.create_task`` pattern) would otherwise all clear the latch
+        # check before their first await and probe in parallel. Set and checked
         # synchronously, so no asyncio.Lock and no loop-binding concern.
         self._ensure_in_flight = False
-        # Single-flight alone is NOT enough: inside one asyncio.gather each write
-        # still runs a full pass once the previous one finished, so a burst of N
-        # first writes spent the whole retry budget immediately and latched on
-        # "unknown". Re-probing is therefore also rate-limited in wall clock, so
-        # the budget measures elapsed recovery time rather than caller volume.
-        self._probe_cooldown_s = probe_cooldown_s
-        self._last_probe_monotonic: Optional[float] = None
 
     @staticmethod
     def _require_pymongo():
@@ -473,29 +452,26 @@ class ObservabilityWriter:
         # best-effort and the in-flight pass will finish it.
         if self._indexes_ensured or self._ensure_in_flight:
             return
-        # Every conflicting collection already has a verdict, and re-running
-        # create_index only re-raises code 85; nothing can change before the next
-        # probe is due. Rate-limit the WHOLE pass, not just the probe, so a
-        # degraded store (the only state that leaves us unlatched) is not charged
-        # 3 create_index round trips per write batch inside write_timeout_s.
-        if self._conflict_outcomes and not self._cooldown_elapsed():
-            return
         self._ensure_in_flight = True
         try:
             await self._ensure_trace_indexes_once()
         finally:
             self._ensure_in_flight = False
 
-    def _cooldown_elapsed(self) -> bool:
-        """True if enough wall clock has passed to justify another probe."""
-        if self._last_probe_monotonic is None:
-            return True
-        return (time.monotonic() - self._last_probe_monotonic) >= self._probe_cooldown_s
-
     async def _ensure_trace_indexes_once(self) -> None:
-        """One pass of :meth:`ensure_trace_indexes`, serialized by its caller."""
+        """One pass of :meth:`ensure_trace_indexes`, serialized by its caller.
+
+        Report-once-and-latch. An index-options conflict (code 85) is reported
+        with its actionable remedy and treated as TERMINAL — including the case
+        where the live TTL could not even be read. The SDK never mutates a shared
+        TTL index, so a conflict does not resolve itself and there is nothing to
+        gain by re-probing; an operator acts on the logged command. This
+        deliberately drops the earlier retry-on-recovery behaviour, whose
+        machinery was the source of every review finding on this method and only
+        ever benefited a narrow degraded-store race the real incident never hit
+        (BLA-1753 round 8).
+        """
         _, _, OperationFailure = self._require_pymongo()
-        probed = False
 
         all_handled = True
         by_remedy: Dict[str, List[str]] = {"stale_ttl": [], "no_ttl": [], "unreadable": []}
@@ -504,28 +480,14 @@ class ObservabilityWriter:
                 await self._db[coll].create_index("received_at", expireAfterSeconds=self._ttl_seconds)
             except OperationFailure as e:  # noqa: BLE001 — best-effort, never raise
                 if getattr(e, "code", None) == 85:  # IndexOptionsConflict
-                    # Classify once per collection. Only an "unreadable" verdict
-                    # is worth re-probing (the store may recover), and only
-                    # while attempts remain.
-                    # Classify once per collection. Only an "unreadable" verdict
-                    # is worth re-probing (the store may recover), while attempts
-                    # remain. The pass-level cooldown gate in the public entry
-                    # point already guarantees the window has elapsed, so no
-                    # second cooldown check is needed here.
-                    cached = self._conflict_outcomes.get(coll)
-                    retry_unknown = (
-                        cached == "unreadable"
-                        and self._conflict_probe_attempts < self._max_conflict_probes
-                    )
-                    if cached is not None and not retry_unknown:
-                        outcome = cached
-                    else:
+                    # Classify once per collection and cache it: a code-85 verdict
+                    # is terminal, so it must not be re-reported just because a
+                    # SIBLING collection failed for an unrelated reason (e.g. a
+                    # code-13 Unauthorized) and kept the pass unlatched.
+                    outcome = self._conflict_outcomes.get(coll)
+                    if outcome is None:
                         outcome = await self._report_index_conflict(coll, e)
                         self._conflict_outcomes[coll] = outcome
-                        probed = True
-                        # Stamp the window on the probe itself — the event this
-                        # timestamp names — rather than behind a separate guard.
-                        self._last_probe_monotonic = time.monotonic()
                     if outcome in by_remedy:
                         by_remedy[outcome].append(coll)
                 else:
@@ -535,65 +497,23 @@ class ObservabilityWriter:
                 all_handled = False
                 logger.warning("Failed to ensure TTL index on %s: %s", coll, e)
 
-        # A conflict whose live state we COULD read is terminal — the existing
-        # index stays authoritative and no retry changes that, so latch and let
-        # the logged command be the escalation. An UNREADABLE live state is not
-        # terminal: the store may recover and we would then owe an accurate
-        # report. Retry it, but bounded, and rate-limited by the caller's gate.
-        unreadable = by_remedy["unreadable"]
-        if unreadable:
-            # Count an ATTEMPT only when this pass actually probed. A pass that
-            # short-circuited on the cached verdict cost nothing and must not
-            # consume budget, or a burst of writes would exhaust it without a
-            # single extra round trip.
-            if probed:
-                self._conflict_probe_attempts += 1
-            if self._conflict_probe_attempts < self._max_conflict_probes:
-                all_handled = False
-            elif probed:
-                # Budget exhausted on the pass that spent the last attempt: we
-                # are about to latch and go silent, so announce the transition
-                # from "still retrying" to "permanently unknown" explicitly.
-                logger.error(
-                    "Observability: retry budget exhausted after %d attempts; the "
-                    "live TTL for %s is now permanently UNKNOWN for this process — "
-                    "inspect with getIndexes().",
-                    self._conflict_probe_attempts, ", ".join(unreadable),
-                )
-
         if all_handled:
             self._indexes_ensured = True
             if not any(by_remedy.values()):
                 logger.info("Observability TTL indexes ensured (ttl=%ss)", self._ttl_seconds)
 
         # The rollup is emitted whenever the CONFLICT STATE changes, whether or
-        # not the latch was set. Two reasons it is not a one-shot flag:
-        #   * a sibling failure (e.g. code 13) keeps all_handled False, and that
-        #     is precisely where an operator most needs the summary;
-        #   * an "unreadable" state can later reclassify to a real stale TTL, and
-        #     that new remedy must be reported rather than suppressed by the
-        #     earlier unknown-state rollup.
-        # Keying on the signature also stops an unchanged state from re-logging.
-        # Fold the attempt count into the "unreadable" bucket only, so the rollup
-        # re-emits as the count climbs (2, 3) instead of freezing at 1 — a
-        # readable-state remedy never changes across passes, but an unreadable
-        # one's whole story is "we are still trying, now on attempt N".
+        # not the pass latched — a sibling non-85 failure keeps it unlatched, and
+        # that is precisely where an operator most needs the summary. Keying on a
+        # signature of the remedy buckets re-emits on change and stays quiet on a
+        # steady state (no per-batch spam). Summarize BY REMEDY: collMod fixes a
+        # stale TTL, a non-TTL index needs drop+recreate, and an unknown state
+        # needs inspection — one blanket line would be wrong for two of the three.
         signature = tuple(
-            (
-                remedy,
-                tuple(colls),
-                self._conflict_probe_attempts if remedy == "unreadable" else None,
-            )
-            for remedy, colls in sorted(by_remedy.items()) if colls
+            (remedy, tuple(colls)) for remedy, colls in sorted(by_remedy.items()) if colls
         )
         if signature and signature != self._conflict_summary_signature:
             self._conflict_summary_signature = signature
-            # Never claim "ensured (ttl=X)" while X is the value NOT in effect —
-            # a false all-clear is the same misleading signal this change exists
-            # to remove (BLA-1753). Summarize BY REMEDY: collMod fixes a stale
-            # TTL, but a non-TTL index needs drop+recreate and an unknown state
-            # needs inspection, so one blanket "run collMod" line would be wrong
-            # for two of the three.
             if by_remedy["stale_ttl"]:
                 logger.warning(
                     "Observability: %d collection(s) have a STALE TTL awaiting a manual "
@@ -607,13 +527,12 @@ class ObservabilityWriter:
                     "TTL (%s); they need a DROP + RECREATE, not a collMod.",
                     len(by_remedy["no_ttl"]), ", ".join(by_remedy["no_ttl"]),
                 )
-            if unreadable:
+            if by_remedy["unreadable"]:
                 logger.warning(
                     "Observability: %d collection(s) conflict with an unreadable live "
-                    "TTL (%s) after %d attempt(s); state unknown — inspect with "
-                    "getIndexes() before assuming any remedy.",
-                    len(unreadable), ", ".join(unreadable),
-                    self._conflict_probe_attempts,
+                    "TTL (%s); state unknown — inspect with getIndexes() before "
+                    "assuming any remedy.",
+                    len(by_remedy["unreadable"]), ", ".join(by_remedy["unreadable"]),
                 )
 
     async def write_records(
