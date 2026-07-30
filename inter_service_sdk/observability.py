@@ -31,6 +31,7 @@ the extra: ``pip install inter-service-sdk[observability]``. The builders and
 import asyncio
 import logging
 import threading
+import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 
@@ -280,6 +281,20 @@ class ObservabilityWriter:
         # the real by-remedy rollup forever once the store recovered and the same
         # collections reclassified as genuinely stale.
         self._conflict_summary_signature: Optional[tuple] = None
+        # Single-flight guard. The attempt counter below assumes passes are
+        # spread over SUCCESSIVE write batches; without this, a burst of
+        # concurrent first writes (the advertised ``asyncio.create_task``
+        # pattern) all clear the latch check before their first await, so they
+        # probe in parallel and blow past the bound in one go. Set and checked
+        # synchronously, so no asyncio.Lock and no loop-binding concern.
+        self._ensure_in_flight = False
+        # Single-flight alone is NOT enough: inside one asyncio.gather each write
+        # still runs a full pass once the previous one finished, so a burst of N
+        # first writes spent the whole retry budget immediately and latched on
+        # "unknown". Re-probing is therefore also rate-limited in wall clock, so
+        # the budget measures elapsed recovery time rather than caller volume.
+        self._probe_cooldown_s = 30.0
+        self._last_probe_monotonic: Optional[float] = None
 
     @staticmethod
     def _require_pymongo():
@@ -446,9 +461,28 @@ class ObservabilityWriter:
         :meth:`_report_stale_ttl` for why mutating a shared TTL index is an
         operator action rather than a library one.
         """
-        if self._indexes_ensured:
+        # Both the check and the set are synchronous — no await between them —
+        # so this is atomic within an event loop. A concurrent write that finds
+        # a pass already in flight simply proceeds; index bookkeeping is
+        # best-effort and the in-flight pass will finish it.
+        if self._indexes_ensured or self._ensure_in_flight:
             return
+        self._ensure_in_flight = True
+        try:
+            await self._ensure_trace_indexes_once()
+        finally:
+            self._ensure_in_flight = False
+
+    def _cooldown_elapsed(self) -> bool:
+        """True if enough wall clock has passed to justify another probe."""
+        if self._last_probe_monotonic is None:
+            return True
+        return (time.monotonic() - self._last_probe_monotonic) >= self._probe_cooldown_s
+
+    async def _ensure_trace_indexes_once(self) -> None:
+        """One pass of :meth:`ensure_trace_indexes`, serialized by its caller."""
         _, _, OperationFailure = self._require_pymongo()
+        probed = False
 
         all_handled = True
         by_remedy: Dict[str, List[str]] = {"stale_ttl": [], "no_ttl": [], "unreadable": []}
@@ -464,12 +498,14 @@ class ObservabilityWriter:
                     retry_unknown = (
                         cached == "unreadable"
                         and self._conflict_probe_attempts < self._max_conflict_probes
+                        and self._cooldown_elapsed()
                     )
                     if cached is not None and not retry_unknown:
                         outcome = cached
                     else:
                         outcome = await self._report_index_conflict(coll, e)
                         self._conflict_outcomes[coll] = outcome
+                        probed = True
                     if outcome in by_remedy:
                         by_remedy[outcome].append(coll)
                 else:
@@ -485,9 +521,17 @@ class ObservabilityWriter:
         # terminal: the store may recover and we would then owe an accurate
         # report. Retry it, but bounded — re-probing forever would put 2 extra
         # round trips per collection on every write batch.
+        if probed:
+            self._last_probe_monotonic = time.monotonic()
+
         unreadable = by_remedy["unreadable"]
         if unreadable:
-            self._conflict_probe_attempts += 1
+            # Count an ATTEMPT only when this pass actually probed. A pass that
+            # short-circuited on the cached verdict cost nothing and must not
+            # consume budget, or a burst of writes would exhaust it without a
+            # single extra round trip.
+            if probed:
+                self._conflict_probe_attempts += 1
             if self._conflict_probe_attempts < self._max_conflict_probes:
                 all_handled = False
 

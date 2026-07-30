@@ -561,6 +561,7 @@ async def test_unreadable_live_ttl_says_so_rather_than_asserting_the_index_exist
 
     db = ConflictingDB(live_ttl_seconds=30 * 86400, index_info_raises=True)
     writer = ObservabilityWriter(db, ttl_days=1825)
+    writer._probe_cooldown_s = 0  # exercise re-probing without waiting
     with caplog.at_level(logging.INFO):
         await writer.ensure_trace_indexes()
 
@@ -609,6 +610,7 @@ async def test_unreadable_live_ttl_retries_then_reports_accurately_on_recovery(c
 
     db = ConflictingDB(live_ttl_seconds=30 * 86400, index_info_raises=True)
     writer = ObservabilityWriter(db, ttl_days=1825)
+    writer._probe_cooldown_s = 0  # exercise re-probing without waiting
     await writer.ensure_trace_indexes()
     assert writer._indexes_ensured is False        # did NOT latch on unknown
 
@@ -635,6 +637,7 @@ async def test_recovery_from_unreadable_emits_the_real_remedy_summary(caplog):
 
     db = ConflictingDB(live_ttl_seconds=30 * 86400, index_info_raises=True)
     writer = ObservabilityWriter(db, ttl_days=1825)
+    writer._probe_cooldown_s = 0  # exercise re-probing without waiting
     with caplog.at_level(logging.WARNING):
         await writer.ensure_trace_indexes()
     assert "state unknown" in caplog.text
@@ -669,10 +672,78 @@ async def test_unchanged_conflict_state_does_not_re_log_the_summary(caplog):
 
 
 @pytest.mark.asyncio
+async def test_concurrent_first_writes_do_not_multiply_probes_or_burn_the_retry_budget():
+    """The SDK advertises `asyncio.create_task` off the request path, so the
+    first writes routinely arrive as a burst. Without a single-flight guard they
+    all clear the latch check before their first await: probes multiply, the
+    per-pass attempt counter blows past its bound in one go, and the writer
+    latches on `unknown` — killing the bounded recovery path entirely.
+
+    Default cooldown on purpose: single-flight alone does not fix this, because
+    inside one gather each write still runs a full pass after the previous
+    finished. The wall-clock rate limit is what makes the budget measure elapsed
+    recovery time rather than caller volume.
+    """
+    db = ConflictingDB(live_ttl_seconds=30 * 86400, index_info_raises=True)
+    writer = ObservabilityWriter(db, ttl_days=1825)
+
+    await asyncio.gather(*[
+        writer.write_records([llm_trace("r")], user_id="u1", client_email="u@b.com")
+        for _ in range(5)
+    ])
+
+    probes = [op for op in db.index_ops if op[0] == "index_information"]
+    assert len(probes) == 3                       # one pass, not five
+    assert writer._conflict_probe_attempts == 1   # budget not burned
+    assert writer._indexes_ensured is False       # still retryable
+
+    # ...so recovery still works and the real remedy still surfaces once the
+    # rate limit allows the next probe.
+    for coll in db._colls.values():
+        coll.index_info_raises = False
+    writer._probe_cooldown_s = 0
+    await writer.write_records([llm_trace("r")], user_id="u1", client_email="u@b.com")
+    assert writer._conflict_outcomes[LLM_TRACES] == "stale_ttl"
+
+
+@pytest.mark.asyncio
+async def test_single_flight_prevents_overlapping_passes_when_the_probe_awaits():
+    """A real Motor `index_information()` yields to the loop, so without a
+    single-flight guard concurrent writes interleave INSIDE one pass — each gets
+    past the latch and the cooldown check before any of them records a probe.
+    The cooldown alone cannot stop that; only the guard can."""
+    class SlowCollection(ConflictingCollection):
+        async def index_information(self):
+            await asyncio.sleep(0)          # yield, as a real driver does
+            return await super().index_information()
+
+    class SlowDB(ConflictingDB):
+        def __getitem__(self, name):
+            if name not in self._colls:
+                coll = SlowCollection(name, self.calls)
+                coll.live_ttl_seconds = self._live_ttl_seconds
+                coll.index_ops = self.index_ops
+                self._colls[name] = coll
+            return self._colls[name]
+
+    db = SlowDB(live_ttl_seconds=30 * 86400)
+    writer = ObservabilityWriter(db, ttl_days=1825)
+
+    await asyncio.gather(*[
+        writer.write_records([llm_trace("r")], user_id="u1", client_email="u@b.com")
+        for _ in range(5)
+    ])
+
+    probes = [op for op in db.index_ops if op[0] == "index_information"]
+    assert len(probes) == 3          # exactly one pass, not one per coroutine
+
+
+@pytest.mark.asyncio
 async def test_unreadable_live_ttl_retry_is_bounded():
     """Retrying forever would add 2 round trips per collection to every write."""
     db = ConflictingDB(live_ttl_seconds=30 * 86400, index_info_raises=True)
     writer = ObservabilityWriter(db, ttl_days=1825)
+    writer._probe_cooldown_s = 0  # exercise re-probing without waiting
 
     for _ in range(writer._max_conflict_probes + 3):
         await writer.write_records(
