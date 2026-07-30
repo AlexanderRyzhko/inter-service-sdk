@@ -502,7 +502,7 @@ async def test_stale_ttl_logs_live_and_configured_values_and_the_remedy(caplog):
         await writer.ensure_trace_indexes()
 
     text = caplog.text
-    assert "live=30d" in text
+    assert "live=2592000s (~30d)" in text
     assert "configured ttl_days=1825" in text
     assert "collMod" in text and "expireAfterSeconds: 157680000" in text
     for coll in (LLM_TRACES, TOOL_CALLS, AGENT_RUNS):
@@ -620,7 +620,7 @@ async def test_unreadable_live_ttl_retries_then_reports_accurately_on_recovery(c
         await writer.write_records(
             [llm_trace("r")], user_id="u1", client_email="u@b.com"
         )
-    assert "TTL index is STALE: live=30d, configured ttl_days=1825" in caplog.text
+    assert "TTL index is STALE: live=2592000s (~30d), configured ttl_days=1825" in caplog.text
     assert writer._indexes_ensured is True
     assert db.commands == []
 
@@ -639,6 +639,80 @@ async def test_unreadable_live_ttl_retry_is_bounded():
     assert writer._conflict_probe_attempts == writer._max_conflict_probes
     # 3 collections x 2 ops (create_index + index_information) x 3 attempts
     assert len(db.index_ops) == 3 * 2 * writer._max_conflict_probes
+
+
+@pytest.mark.asyncio
+async def test_sibling_failure_does_not_reprobe_already_classified_collections(caplog):
+    """A code-13 on ONE collection keeps the latch open. The other collections'
+    code-85 conflicts are already terminal and must not be re-probed or
+    re-reported on every write batch — that would put an unbounded ERROR stream
+    and 2 extra round trips per collection on the write path, which is the
+    opposite of what this branch's own comment promises."""
+    import logging
+    from pymongo.errors import OperationFailure
+
+    class Unauthorized(ConflictingCollection):
+        async def create_index(self, *args, **kwargs):
+            if self.index_ops is not None:
+                self.index_ops.append(("create_index", self.name))
+            raise OperationFailure("not authorized", 13)
+
+    class MixedDB(ConflictingDB):
+        def __getitem__(self, name):
+            if name not in self._colls:
+                cls = Unauthorized if name == LLM_TRACES else ConflictingCollection
+                coll = cls(name, self.calls)
+                coll.live_ttl_seconds = self._live_ttl_seconds
+                coll.index_ops = self.index_ops
+                self._colls[name] = coll
+            return self._colls[name]
+
+    db = MixedDB(live_ttl_seconds=30 * 86400)
+    writer = ObservabilityWriter(db, ttl_days=1825)
+    await writer.ensure_trace_indexes()
+    assert writer._indexes_ensured is False          # code 13 keeps it open
+    probes_after_first = [op for op in db.index_ops if op[0] == "index_information"]
+    assert len(probes_after_first) == 2              # the two code-85 collections
+
+    caplog.clear()
+    with caplog.at_level(logging.ERROR):
+        for _ in range(3):
+            await writer.write_records(
+                [llm_trace("r")], user_id="u1", client_email="u@b.com"
+            )
+
+    probes_now = [op for op in db.index_ops if op[0] == "index_information"]
+    assert len(probes_now) == 2                      # never re-probed
+    assert "TTL index is STALE" not in caplog.text   # never re-reported
+
+
+@pytest.mark.asyncio
+async def test_summary_is_emitted_even_when_a_sibling_failure_blocks_the_latch(caplog):
+    """The rollup must not be gated on latching — a mixed-failure run is exactly
+    where the operator most needs it."""
+    import logging
+    from pymongo.errors import OperationFailure
+
+    class Unauthorized(ConflictingCollection):
+        async def create_index(self, *args, **kwargs):
+            raise OperationFailure("not authorized", 13)
+
+    class MixedDB(ConflictingDB):
+        def __getitem__(self, name):
+            if name not in self._colls:
+                cls = Unauthorized if name == LLM_TRACES else ConflictingCollection
+                coll = cls(name, self.calls)
+                coll.live_ttl_seconds = self._live_ttl_seconds
+                coll.index_ops = self.index_ops
+                self._colls[name] = coll
+            return self._colls[name]
+
+    db = MixedDB(live_ttl_seconds=30 * 86400)
+    writer = ObservabilityWriter(db, ttl_days=1825)
+    with caplog.at_level(logging.WARNING):
+        await writer.ensure_trace_indexes()
+    assert writer._indexes_ensured is False
+    assert "awaiting a manual collMod" in caplog.text
 
 
 @pytest.mark.asyncio

@@ -270,6 +270,12 @@ class ObservabilityWriter:
         # costs 2 extra round trips per collection on every write batch.
         self._conflict_probe_attempts = 0
         self._max_conflict_probes = 3
+        # Per-collection classification cache. A code-85 conflict is terminal for
+        # that collection, so it must never be re-probed or re-reported just
+        # because a SIBLING collection failed for an unrelated reason (e.g. a
+        # code-13 Unauthorized) and kept the latch open.
+        self._conflict_outcomes: Dict[str, str] = {}
+        self._conflict_summary_logged = False
 
     @staticmethod
     def _require_pymongo():
@@ -355,10 +361,10 @@ class ObservabilityWriter:
             # of expireAfterSeconds would be a no-op, so don't suggest it.
             logger.error(
                 "%s received_at index conflicts on an option other than the TTL "
-                "(live TTL is %sd, matching the configured ttl_days=%s): %s. The "
+                "(live TTL is %ss, matching the configured ttl_days=%s): %s. The "
                 "existing index stays authoritative — inspect it with "
                 "db.%s.getIndexes().",
-                coll, live // 86400, self._ttl_seconds // 86400, exc, coll,
+                coll, live, self._ttl_seconds // 86400, exc, coll,
             )
             return "other"
 
@@ -408,12 +414,19 @@ class ObservabilityWriter:
         ``OBSERVABILITY_TRACE_TTL_DAYS=365``. This logs at ERROR with both
         numbers and the exact command, so it is greppable and alertable.
         """
+        # Raw seconds, not floor-divided days: the live value comes from the
+        # server and need not be day-aligned. `live // 86400` printed a 3600s TTL
+        # as "0d" (indistinguishable from a real expireAfterSeconds: 0) and a
+        # 1825d+1h TTL as "1825d" — asserting a mismatch while showing two
+        # identical numbers, which reads as an SDK bug and gets dismissed.
         logger.error(
-            "%s TTL index is STALE: live=%sd, configured ttl_days=%s. Retention will "
-            "NOT change until an operator applies it (this library never mutates a "
-            "shared TTL index). Run: db.runCommand({collMod: \"%s\", index: "
-            "{keyPattern: {received_at: 1}, expireAfterSeconds: %s}})",
-            coll, live // 86400, self._ttl_seconds // 86400, coll, self._ttl_seconds,
+            "%s TTL index is STALE: live=%ss (~%sd), configured ttl_days=%s "
+            "(%ss). Retention will NOT change until an operator applies it (this "
+            "library never mutates a shared TTL index). Run: db.runCommand("
+            "{collMod: \"%s\", index: {keyPattern: {received_at: 1}, "
+            "expireAfterSeconds: %s}})",
+            coll, live, live // 86400, self._ttl_seconds // 86400,
+            self._ttl_seconds, coll, self._ttl_seconds,
         )
         return True
 
@@ -440,7 +453,19 @@ class ObservabilityWriter:
                 await self._db[coll].create_index("received_at", expireAfterSeconds=self._ttl_seconds)
             except OperationFailure as e:  # noqa: BLE001 — best-effort, never raise
                 if getattr(e, "code", None) == 85:  # IndexOptionsConflict
-                    outcome = await self._report_index_conflict(coll, e)
+                    # Classify once per collection. Only an "unreadable" verdict
+                    # is worth re-probing (the store may recover), and only
+                    # while attempts remain.
+                    cached = self._conflict_outcomes.get(coll)
+                    retry_unknown = (
+                        cached == "unreadable"
+                        and self._conflict_probe_attempts < self._max_conflict_probes
+                    )
+                    if cached is not None and not retry_unknown:
+                        outcome = cached
+                    else:
+                        outcome = await self._report_index_conflict(coll, e)
+                        self._conflict_outcomes[coll] = outcome
                     if outcome in by_remedy:
                         by_remedy[outcome].append(coll)
                 else:
@@ -464,6 +489,15 @@ class ObservabilityWriter:
 
         if all_handled:
             self._indexes_ensured = True
+            if not any(by_remedy.values()):
+                logger.info("Observability TTL indexes ensured (ttl=%ss)", self._ttl_seconds)
+
+        # The rollup is emitted once, whether or not the latch was set. A sibling
+        # failure (e.g. code 13 on one collection) keeps all_handled False, and
+        # that is precisely the state where an operator most needs the summary —
+        # gating it on the latch meant it never appeared there.
+        if not self._conflict_summary_logged and any(by_remedy.values()):
+            self._conflict_summary_logged = True
             # Never claim "ensured (ttl=X)" while X is the value NOT in effect —
             # a false all-clear is the same misleading signal this change exists
             # to remove (BLA-1753). Summarize BY REMEDY: collMod fixes a stale
@@ -491,8 +525,6 @@ class ObservabilityWriter:
                     len(unreadable), ", ".join(unreadable),
                     self._conflict_probe_attempts,
                 )
-            if not any(by_remedy.values()):
-                logger.info("Observability TTL indexes ensured (ttl=%ss)", self._ttl_seconds)
 
     async def write_records(
         self,
