@@ -283,10 +283,29 @@ class TestClientInjectionFromSyncRouteHandler:
 
 class TestVersionAndExports:
 
-    def test_version_is_1_3_0(self):
-        """AC-15: inter_service_sdk.__version__ == '1.3.0'."""
+    def test_version_is_consistent_across_declarations(self):
+        """The version lives in three files; they must agree.
+
+        Was ``test_version_is_1_3_0``, which pinned a literal and so had to be
+        edited by hand on every release — it silently went red on the BLA-1753
+        bump because ``build_and_publish.py`` rewrites the three source files
+        and knows nothing about this test. Comparing the declarations to each
+        other removes the literal, and with it the whole drift class.
+        """
+        import re
+        from pathlib import Path
+
         import inter_service_sdk
-        assert inter_service_sdk.__version__ == "1.3.0"
+
+        root = Path(__file__).resolve().parent.parent
+        pyproject = re.search(
+            r'^version = "([^"]+)"', (root / "pyproject.toml").read_text(), re.M
+        )
+        setup_py = re.search(
+            r'version="([^"]+)"', (root / "setup.py").read_text()
+        )
+        assert pyproject and setup_py, "version declaration not found"
+        assert inter_service_sdk.__version__ == pyproject.group(1) == setup_py.group(1)
 
     def test_tracing_symbols_exported_from_top_level(self):
         """AC-15: TRACE_HEADER, get_trace_id, set_trace_id, BlazelTracingMiddleware,
